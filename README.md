@@ -1,4 +1,4 @@
-# 🤖 Русский Discord Бот
+# 🤖 Русский DiscordEbilBot
 
 Многофункциональный Discord бот на Python с поддержкой русского языка.
 
@@ -45,8 +45,8 @@
 
 1. **Клонируйте репозиторий:**
 ```bash
-git clone https://github.com/ваш-username/russian-discord-bot.git
-cd russian-discord-bot
+git clone https://github.com/BasyaGG/DiscordEbilBot.git
+cd DiscordEbilBot
 ```
 
 2. **Установите зависимости:**
