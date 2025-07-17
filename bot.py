@@ -72,7 +72,8 @@ CITIES = {
 CITY_SHORTCUTS = {
     'спб': 'Санкт-Петербург',
     'питер': 'Санкт-Петербург',
-    'екб': 'Екатеринбург'
+    'екб': 'Екатеринбург',
+    'мск': 'Москва'
 }
 
 # Эмодзи для погодных условий (API уже возвращает русские описания)
@@ -529,12 +530,39 @@ async def twitch_message(ctx, channel_input: str, *, message: str):
         await ctx.reply(f"❌ Канал '{channel_name}' не найден в списке мониторинга. Сначала добавьте его командой `!twitch добавить https://twitch.tv/{channel_name}`")
 
 # Криптовалюты API функции
+async def search_coin_id(symbol):
+    """Поиск ID монеты по символу через CoinGecko API"""
+    try:
+        url = f"https://api.coingecko.com/api/v3/search?query={symbol}"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    coins = data.get('coins', [])
+                    
+                    # Если нашли монеты, возвращаем ID первой (наиболее релевантной)
+                    if coins:
+                        # Сначала ищем точное совпадение по символу
+                        for coin in coins:
+                            if coin.get('symbol', '').lower() == symbol.lower():
+                                return coin.get('id')
+                        
+                        # Если точного совпадения нет, берем первую из результатов
+                        return coins[0].get('id')
+        
+        return None
+    except Exception as e:
+        print(f"Ошибка при поиске ID для {symbol}: {e}")
+        return None
+
 async def get_crypto_data(symbols):
     """Получить данные о криптовалютах через CoinGecko API"""
     if isinstance(symbols, str):
         symbols = [symbols]
     
     results = {}
+    symbol_to_id_map = {}  # Для сохранения соответствия символа и ID
     
     for symbol in symbols:
         symbol_lower = symbol.lower()
@@ -544,6 +572,7 @@ async def get_crypto_data(symbols):
             btc_dominance = await get_btc_dominance()
             if btc_dominance:
                 results['btc.d'] = btc_dominance
+                symbol_to_id_map[symbol_lower] = 'btc.d'
             continue
         
         # Специальная обработка для NASDAQ
@@ -551,13 +580,21 @@ async def get_crypto_data(symbols):
             nasdaq_data = await get_nasdaq_data()
             if nasdaq_data:
                 results['nasdaq'] = nasdaq_data
+                symbol_to_id_map[symbol_lower] = 'nasdaq'
             continue
         
         # Обычные криптовалюты
         if symbol_lower in CRYPTO_SYMBOLS:
             coin_id = CRYPTO_SYMBOLS[symbol_lower]
         else:
-            coin_id = symbol_lower
+            # Если символ не в нашем словаре, пробуем найти его через API поиска
+            coin_id = await search_coin_id(symbol_lower)
+            if not coin_id:
+                # Если не нашли, пробуем использовать символ как ID
+                coin_id = symbol_lower
+        
+        # Сохраняем соответствие символа и ID
+        symbol_to_id_map[symbol_lower] = coin_id
         
         # Получаем данные для одной криптовалюты
         url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd&include_24hr_change=true&include_market_cap=true"
@@ -568,25 +605,47 @@ async def get_crypto_data(symbols):
                     if response.status == 200:
                         data = await response.json()
                         if coin_id in data:
+                            # Сохраняем данные с оригинальным символом для отображения
                             results[coin_id] = data[coin_id]
+                            results[coin_id]['original_symbol'] = symbol
         except Exception as e:
-            print(f"Ошибка при получении данных для {symbol}: {e}")
+            print(f"Ошибка при получении данных для {symbol} (ID: {coin_id}): {e}")
     
     return results if results else None
 
 async def get_btc_dominance():
-    """Получить Bitcoin Dominance"""
-    url = "https://api.coingecko.com/api/v3/global"
-    
+    """Получить Bitcoin Dominance с расчетом изменения за 24ч"""
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
+            # Получаем текущие данные
+            current_url = "https://api.coingecko.com/api/v3/global"
+            async with session.get(current_url) as response:
                 if response.status == 200:
-                    data = await response.json()
-                    btc_dominance = data.get('data', {}).get('market_cap_percentage', {}).get('btc', 0)
+                    current_data = await response.json()
+                    current_dominance = current_data.get('data', {}).get('market_cap_percentage', {}).get('btc', 0)
+                    
+                    # Получаем данные BTC для расчета приблизительного изменения доминации
+                    btc_url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true"
+                    async with session.get(btc_url) as btc_response:
+                        if btc_response.status == 200:
+                            btc_data = await btc_response.json()
+                            btc_change_24h = btc_data.get('bitcoin', {}).get('usd_24h_change', 0)
+                            
+                            # Приблизительный расчет изменения доминации на основе изменения цены BTC
+                            # Если BTC растет быстрее рынка, доминация увеличивается
+                            # Это упрощенный расчет, но дает представление о тренде
+                            estimated_dominance_change = btc_change_24h * 0.1  # Коэффициент 0.1 для сглаживания
+                            
+                            return {
+                                'usd': current_dominance,
+                                'usd_24h_change': estimated_dominance_change,
+                                'usd_market_cap': 0
+                            }
+                    
+                    # Если не удалось получить данные BTC, возвращаем без изменения
                     return {
-                        'usd': btc_dominance,
-                        'usd_24h_change': 0,  # CoinGecko не предоставляет изменение доминации за 24ч
+                        'usd': current_dominance,
+                        'usd_24h_change': 0,
                         'usd_market_cap': 0
                     }
     except Exception as e:
@@ -636,6 +695,19 @@ async def get_nasdaq_data():
         'usd_market_cap': 0
     }
 
+def get_tradingview_link(symbol):
+    """Получить ссылку на TradingView для символа"""
+    symbol_upper = symbol.upper()
+    
+    # Специальные случаи
+    if symbol.lower() == 'btc.d':
+        return "https://www.tradingview.com/symbols/CRYPTOCAP-BTC.D/"
+    elif symbol.lower() == 'nasdaq':
+        return "https://www.tradingview.com/symbols/NASDAQ-NDX/"
+    else:
+        # Для криптовалют используем формат BINANCE:SYMBOLUSDT
+        return f"https://www.tradingview.com/symbols/BINANCE-{symbol_upper}USDT/"
+
 def format_crypto_data(crypto_data, requested_symbols):
     """Форматировать данные о криптовалютах"""
     if not crypto_data:
@@ -651,10 +723,25 @@ def format_crypto_data(crypto_data, requested_symbols):
             if 'btc.d' in crypto_data:
                 data = crypto_data['btc.d']
                 dominance = data.get('usd', 0)
+                change_24h = data.get('usd_24h_change', 0)
                 
-                result += f"**BTC.D** 👑\n"
+                # Определяем эмодзи для изменения
+                if change_24h > 0:
+                    change_emoji = "📈"
+                    change_color = "+"
+                elif change_24h < 0:
+                    change_emoji = "📉"
+                    change_color = ""
+                else:
+                    change_emoji = "➡️"
+                    change_color = ""
+                
+                result += f"**BTC.D** 👑 {change_emoji}\n"
                 result += f"📊 Доминация: **{dominance:.2f}%**\n"
-                result += f"💡 Bitcoin доминация на рынке\n\n"
+                if change_24h != 0:
+                    result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+                result += f"💡 Bitcoin доминация на рынке\n"
+                result += f"📈 [TradingView]({get_tradingview_link('btc.d')})\n\n"
                 continue
         
         # Специальная обработка для NASDAQ
@@ -678,13 +765,1889 @@ def format_crypto_data(crypto_data, requested_symbols):
                 result += f"**NASDAQ** 📊 {change_emoji}\n"
                 result += f"💰 Индекс: **{price:,.2f}**\n"
                 result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
-                result += f"🏛️ Фондовый рынок США\n\n"
+                result += f"🏛️ Фондовый рынок США\n"
+                result += f"📈 [TradingView]({get_tradingview_link('nasdaq')})\n\n"
                 continue
         
         # Обычные криптовалюты
         coin_id = CRYPTO_SYMBOLS.get(symbol_lower, symbol_lower)
         
+        # Ищем данные по разным ключам
+        data_key = None
         if coin_id in crypto_data:
+            data_key = coin_id
+        else:
+            # Ищем по всем ключам в crypto_data
+            for key in crypto_data.keys():
+                if key != 'btc.d' and key != 'nasdaq':
+                    if crypto_data[key].get('original_symbol', '').lower() == symbol_lower:
+                        data_key = key
+                        break
+        
+        if data_key:
+            data = crypto_data[data_key]
+            price = data.get('usd', 0)
+            change_24h = data.get('usd_24h_change', 0)
+            market_cap = data.get('usd_market_cap', 0)
+            
+            # Определяем эмодзи для изменения цены
+            if change_24h > 0:
+                change_emoji = "📈"
+                change_color = "+"
+            elif change_24h < 0:
+                change_emoji = "📉"
+                change_color = ""
+            else:
+                change_emoji = "➡️"
+                change_color = ""
+            
+            # Форматирование цены
+            if symbol_lower in ['btc', 'eth']:
+                price_str = f"${price:,.2f}" if price >= 1 else f"${price:.6f}"
+            else:
+                price_str = f"${price:,.4f}" if price >= 1 else f"${price:.8f}"
+            
+            # Форматирование рыночной капитализации
+            if market_cap >= 1_000_000_000:
+                market_cap_str = f"${market_cap/1_000_000_000:.1f}B"
+            elif market_cap >= 1_000_000:
+                market_cap_str = f"${market_cap/1_000_000:.1f}M"
+            elif market_cap > 0:
+                market_cap_str = f"${market_cap:,.0f}"
+            else:
+                market_cap_str = "N/A"
+            
+            result += f"**{symbol.upper()}** {change_emoji}\n"
+            result += f"💰 Цена: **{price_str}**\n"
+            result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+            if market_cap > 0:
+                result += f"🏦 Кап: **{market_cap_str}**\n"
+            result += f"📈 [TradingView]({get_tradingview_link(symbol)})\n\n"
+    
+    return result.strip() if result else "❌ Данные недоступны"
+
+@bot.command(name='крипта', aliases=['crypto'])
+async def crypto_command(ctx, *symbols):
+    """Показать информацию о криптовалютах"""
+    try:
+        if not symbols:
+            # Показать основные криптовалюты и индексы (ваш список)
+            default_symbols = ['btc.d', 'nasdaq', 'btc', 'eth', 'crv']
+            crypto_data = await get_crypto_data(default_symbols)
+            
+            if crypto_data:
+                embed = discord.Embed(
+                    title="💰 Основные криптовалюты",
+                    color=0xF7931A
+                )
+                
+                formatted_data = format_crypto_data(crypto_data, default_symbols)
+                embed.description = formatted_data
+                embed.set_footer(text="Данные предоставлены CoinGecko • Обновляется в реальном времени")
+                
+                await ctx.reply(embed=embed)
+            else:
+                await ctx.reply("❌ Не удалось получить данные о криптовалютах.")
+        else:
+            # Показать конкретные криптовалюты
+            crypto_data = await get_crypto_data(list(symbols))
+            
+            if crypto_data:
+                embed = discord.Embed(
+                    title="💰 Криптовалюты",
+                    color=0xF7931A
+                )
+                
+                formatted_data = format_crypto_data(crypto_data, symbols)
+                embed.description = formatted_data
+                embed.set_footer(text="Данные предоставлены CoinGecko • Обновляется в реальном времени")
+                
+                await ctx.reply(embed=embed)
+            else:
+                await ctx.reply("❌ Не удалось найти указанные криптовалюты. Проверьте символы.")
+                
+    except Exception as e:
+        await ctx.reply("❌ Произошла ошибка при получении данных о криптовалютах.")
+        print(f"Ошибка в команде крипта: {e}")
+
+@bot.command(name='привет', aliases=['hello'])
+async def hello(ctx):
+    """Поздороваться с ботом"""
+    await ctx.reply(PHRASES['hello'])
+
+@bot.command(name='пока', aliases=['bye'])
+async def goodbye(ctx):
+    """Попрощаться с ботом"""
+    await ctx.reply(PHRASES['goodbye'])
+
+def is_channel_allowed(ctx):
+    """Проверить, разрешен ли канал для выполнения команд"""
+    guild_id = ctx.guild.id if ctx.guild else None
+    
+    # Если сервер не настроен, разрешаем все каналы
+    if guild_id not in ALLOWED_CHANNELS:
+        return True
+    
+    # Если список пустой, разрешаем все каналы
+    if not ALLOWED_CHANNELS[guild_id]:
+        return True
+    
+    # Проверяем, есть ли текущий канал в списке разрешенных
+    return ctx.channel.id in ALLOWED_CHANNELS[guild_id]
+
+@bot.group(name='канал', aliases=['channel'], invoke_without_command=True)
+async def channel_group(ctx):
+    """Группа команд для управления разрешенными каналами"""
+    await ctx.send("Используйте `!канал добавить`, `!канал удалить`, `!канал список` или `!канал сброс`")
+
+@channel_group.command(name='добавить', aliases=['add'])
+@commands.has_permissions(administrator=True)
+async def channel_add(ctx):
+    """Добавить текущий канал в список разрешенных"""
+    guild_id = ctx.guild.id
+    channel_id = ctx.channel.id
+    
+    if guild_id not in ALLOWED_CHANNELS:
+        ALLOWED_CHANNELS[guild_id] = []
+    
+    if channel_id not in ALLOWED_CHANNELS[guild_id]:
+        ALLOWED_CHANNELS[guild_id].append(channel_id)
+        await ctx.reply(f"✅ Канал {ctx.channel.mention} добавлен в список разрешенных для команд бота!")
+    else:
+        await ctx.reply(f"ℹ️ Канал {ctx.channel.mention} уже находится в списке разрешенных.")
+
+@channel_group.command(name='удалить', aliases=['remove'])
+@commands.has_permissions(administrator=True)
+async def channel_remove(ctx):
+    """Удалить текущий канал из списка разрешенных"""
+    guild_id = ctx.guild.id
+    channel_id = ctx.channel.id
+    
+    if guild_id in ALLOWED_CHANNELS and channel_id in ALLOWED_CHANNELS[guild_id]:
+        ALLOWED_CHANNELS[guild_id].remove(channel_id)
+        await ctx.reply(f"✅ Канал {ctx.channel.mention} удален из списка разрешенных.")
+    else:
+        await ctx.reply(f"ℹ️ Канал {ctx.channel.mention} не находится в списке разрешенных.")
+
+@channel_group.command(name='список', aliases=['list'])
+async def channel_list(ctx):
+    """Показать список разрешенных каналов"""
+    guild_id = ctx.guild.id
+    
+    if guild_id not in ALLOWED_CHANNELS or not ALLOWED_CHANNELS[guild_id]:
+        await ctx.reply("📋 Бот работает во всех каналах (список разрешенных каналов пуст).")
+        return
+    
+    embed = discord.Embed(
+        title="📋 Разрешенные каналы для команд бота",
+        color=0x00ff00
+    )
+    
+    channel_mentions = []
+    for channel_id in ALLOWED_CHANNELS[guild_id]:
+        channel = ctx.guild.get_channel(channel_id)
+        if channel:
+            channel_mentions.append(channel.mention)
+        else:
+            channel_mentions.append(f"Удаленный канал (ID: {channel_id})")
+    
+    embed.description = "\n".join(channel_mentions) if channel_mentions else "Нет разрешенных каналов"
+    embed.set_footer(text="Бот будет отвечать на команды только в этих каналах")
+    
+    await ctx.reply(embed=embed)
+
+@channel_group.command(name='сброс', aliases=['reset'])
+@commands.has_permissions(administrator=True)
+async def channel_reset(ctx):
+    """Сбросить список разрешенных каналов (разрешить все каналы)"""
+    guild_id = ctx.guild.id
+    
+    if guild_id in ALLOWED_CHANNELS:
+        ALLOWED_CHANNELS[guild_id] = []
+    
+    await ctx.reply("✅ Список разрешенных каналов сброшен. Бот теперь работает во всех каналах!")
+
+@bot.event
+async def on_command_error(ctx, error):
+    """Обработка ошибок команд"""
+    if isinstance(error, commands.CommandNotFound):
+        # Проверяем разрешенные каналы только для существующих команд
+        if is_channel_allowed(ctx):
+            await ctx.reply(PHRASES['unknown'])
+    elif isinstance(error, commands.MissingPermissions):
+        if is_channel_allowed(ctx):
+            await ctx.reply("❌ У вас нет прав администратора для выполнения этой команды.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        if is_channel_allowed(ctx):
+            await ctx.reply("❌ Не хватает аргументов для команды. Используйте `!помощь` для справки.")
+    else:
+        if is_channel_allowed(ctx):
+            await ctx.reply(PHRASES['error'])
+            print(f"Ошибка команды: {error}")
+
+@bot.event
+async def on_message(message):
+    """Обработка сообщений"""
+    # Игнорируем сообщения от ботов
+    if message.author.bot:
+        return
+    
+    # Проверяем, разрешен ли канал для команд
+    if message.content.startswith('!'):
+        # Создаем контекст для проверки канала
+        ctx = await bot.get_context(message)
+        if not is_channel_allowed(ctx):
+            return  # Игнорируем команды в неразрешенных каналах
+    
+    # Обрабатываем команды
+    await bot.process_commands(message)
+    
+    # Реагируем на упоминания (только в разрешенных каналах)
+    if bot.user.mentioned_in(message):
+        ctx = await bot.get_context(message)
+        if is_channel_allowed(ctx):
+            await message.add_reaction('👋')
+
+@bot.command(name='помощь')
+async def help_command(ctx):
+    """Показать справку"""
+    embed = discord.Embed(
+        title="📋 Справка по командам",
+        description=PHRASES['help'],
+        color=0x00ff00
+    )
+    embed.set_footer(text="Бот создан для общения на русском языке")
+    await ctx.reply(embed=embed)
+
+if __name__ == "__main__":
+    # Запуск бота
+    token = os.getenv('DISCORD_TOKEN')
+    if not token:
+        print("Ошибка: DISCORD_TOKEN не найден в .env файле!")
+    else:
+        try:
+            bot.run(token)
+        except Exception as e:
+            print(f"Ошибка запуска бота: {e}")f"💰 Индекс: **{price:,.2f}**\n"
+                result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+                result += f"🏛️ Фондовый рынок США\n"
+                result += f"📈 [TradingView]({get_tradingview_link('nasdaq')})\n\n"
+                continue
+        
+        # Обычные криптовалюты
+        coin_id = CRYPTO_SYMBOLS.get(symbol_lower, symbol_lower)
+        
+        # Ищем данные по разным ключам
+        data_key = None
+        if coin_id in crypto_data:
+            data_key = coin_id
+        else:
+            # Ищем по всем ключам в crypto_data
+            for key in crypto_data.keys():
+                if key != 'btc.d' and key != 'nasdaq':
+                    if crypto_data[key].get('original_symbol', '').lower() == symbol_lower:
+                        data_key = key
+                        break
+        
+        if data_key:
+            data = crypto_data[data_key]
+            price = data.get('usd', 0)
+            change_24h = data.get('usd_24h_change', 0)
+            market_cap = data.get('usd_market_cap', 0)
+            
+            # Определяем эмодзи для изменения цены
+            if change_24h > 0:
+                change_emoji = "📈"
+                change_color = "+"
+            elif change_24h < 0:
+                change_emoji = "📉"
+                change_color = ""
+            else:
+                change_emoji = "➡️"
+                change_color = ""
+            
+            # Форматирование цены
+            if symbol_lower in ['btc', 'eth']:
+                price_str = f"${price:,.2f}" if price >= 1 else f"${price:.6f}"
+            else:
+                price_str = f"${price:,.4f}" if price >= 1 else f"${price:.8f}"
+            
+            # Форматирование рыночной капитализации
+            if market_cap >= 1_000_000_000:
+                market_cap_str = f"${market_cap/1_000_000_000:.1f}B"
+            elif market_cap >= 1_000_000:
+                market_cap_str = f"${market_cap/1_000_000:.1f}M"
+            elif market_cap > 0:
+                market_cap_str = f"${market_cap:,.0f}"
+            else:
+                market_cap_str = "N/A"
+            
+            result += f"**{symbol.upper()}** {change_emoji}\n"
+            result += f"💰 Цена: **{price_str}**\n"
+            result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+            if market_cap > 0:
+                result += f"🏦 Кап: **{market_cap_str}**\n"
+            result += f"📈 [TradingView]({get_tradingview_link(symbol)})\n\n"
+    
+    return result.strip() if result else "❌ Данные недоступны"f"💰 Индекс: **{price:,.2f}**\n"
+                result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+                result += f"🏛️ Фондовый рынок США\n"
+                result += f"📈 [TradingView]({get_tradingview_link('nasdaq')})\n\n"
+                continue
+        
+        # Обычные криптовалюты
+        coin_id = CRYPTO_SYMBOLS.get(symbol_lower, symbol_lower)
+        
+        # Ищем данные по разным ключам
+        data_key = None
+        if coin_id in crypto_data:
+            data_key = coin_id
+        else:
+            # Ищем по всем ключам в crypto_data
+            for key in crypto_data.keys():
+                if key != 'btc.d' and key != 'nasdaq':
+                    if crypto_data[key].get('original_symbol', '').lower() == symbol_lower:
+                        data_key = key
+                        break
+        
+        if data_key:
+            data = crypto_data[data_key]
+            price = data.get('usd', 0)
+            change_24h = data.get('usd_24h_change', 0)
+            market_cap = data.get('usd_market_cap', 0)
+            
+            # Определяем эмодзи для изменения цены
+            if change_24h > 0:
+                change_emoji = "📈"
+                change_color = "+"
+            elif change_24h < 0:
+                change_emoji = "📉"
+                change_color = ""
+            else:
+                change_emoji = "➡️"
+                change_color = ""
+            
+            # Форматирование цены
+            if symbol_lower in ['btc', 'eth']:
+                price_str = f"${price:,.2f}" if price >= 1 else f"${price:.6f}"
+            else:
+                price_str = f"${price:,.4f}" if price >= 1 else f"${price:.8f}"
+            
+            # Форматирование рыночной капитализации
+            if market_cap >= 1_000_000_000:
+                market_cap_str = f"${market_cap/1_000_000_000:.1f}B"
+            elif market_cap >= 1_000_000:
+                market_cap_str = f"${market_cap/1_000_000:.1f}M"
+            elif market_cap > 0:
+                market_cap_str = f"${market_cap:,.0f}"
+            else:
+                market_cap_str = "N/A"
+            
+            result += f"**{symbol.upper()}** {change_emoji}\n"
+            result += f"💰 Цена: **{price_str}**\n"
+            result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+            if market_cap > 0:
+                result += f"🏦 Кап: **{market_cap_str}**\n"
+            result += f"📈 [TradingView]({get_tradingview_link(symbol)})\n\n"
+    
+    return result.strip() if result else "❌ Данные недоступны"
+
+@bot.command(name='крипта', aliases=['crypto'])
+async def crypto_command(ctx, *symbols):
+    """Показать информацию о криптовалютах"""
+    try:
+        if not symbols:
+            # Показать основные криптовалюты и индексы (ваш список)
+            default_symbols = ['btc.d', 'nasdaq', 'btc', 'eth', 'crv']
+            crypto_data = await get_crypto_data(default_symbols)
+            
+            if crypto_data:
+                embed = discord.Embed(
+                    title="💰 Основные криптовалюты",
+                    color=0xF7931A
+                )
+                
+                formatted_data = format_crypto_data(crypto_data, default_symbols)
+                embed.description = formatted_data
+                embed.set_footer(text="Данные предоставлены CoinGecko • Обновляется в реальном времени")
+                
+                await ctx.reply(embed=embed)
+            else:
+                await ctx.reply("❌ Не удалось получить данные о криптовалютах.")
+        else:
+            # Показать конкретные криптовалюты
+            crypto_data = await get_crypto_data(list(symbols))
+            
+            if crypto_data:
+                embed = discord.Embed(
+                    title="💰 Криптовалюты",
+                    color=0xF7931A
+                )
+                
+                formatted_data = format_crypto_data(crypto_data, symbols)
+                embed.description = formatted_data
+                embed.set_footer(text="Данные предоставлены CoinGecko • Обновляется в реальном времени")
+                
+                await ctx.reply(embed=embed)
+            else:
+                await ctx.reply("❌ Не удалось найти указанные криптовалюты. Проверьте символы.")
+                
+    except Exception as e:
+        await ctx.reply("❌ Произошла ошибка при получении данных о криптовалютах.")
+        print(f"Ошибка в команде крипта: {e}")
+
+@bot.command(name='привет', aliases=['hello'])
+async def hello(ctx):
+    """Поздороваться с ботом"""
+    await ctx.reply(PHRASES['hello'])
+
+@bot.command(name='пока', aliases=['bye'])
+async def goodbye(ctx):
+    """Попрощаться с ботом"""
+    await ctx.reply(PHRASES['goodbye'])
+
+def is_channel_allowed(ctx):
+    """Проверить, разрешен ли канал для выполнения команд"""
+    guild_id = ctx.guild.id if ctx.guild else None
+    
+    # Если сервер не настроен, разрешаем все каналы
+    if guild_id not in ALLOWED_CHANNELS:
+        return True
+    
+    # Если список пустой, разрешаем все каналы
+    if not ALLOWED_CHANNELS[guild_id]:
+        return True
+    
+    # Проверяем, есть ли текущий канал в списке разрешенных
+    return ctx.channel.id in ALLOWED_CHANNELS[guild_id]
+
+@bot.group(name='канал', aliases=['channel'], invoke_without_command=True)
+async def channel_group(ctx):
+    """Группа команд для управления разрешенными каналами"""
+    await ctx.send("Используйте `!канал добавить`, `!канал удалить`, `!канал список` или `!канал сброс`")
+
+@channel_group.command(name='добавить', aliases=['add'])
+@commands.has_permissions(administrator=True)
+async def channel_add(ctx):
+    """Добавить текущий канал в список разрешенных"""
+    guild_id = ctx.guild.id
+    channel_id = ctx.channel.id
+    
+    if guild_id not in ALLOWED_CHANNELS:
+        ALLOWED_CHANNELS[guild_id] = []
+    
+    if channel_id not in ALLOWED_CHANNELS[guild_id]:
+        ALLOWED_CHANNELS[guild_id].append(channel_id)
+        await ctx.reply(f"✅ Канал {ctx.channel.mention} добавлен в список разрешенных для команд бота!")
+    else:
+        await ctx.reply(f"ℹ️ Канал {ctx.channel.mention} уже находится в списке разрешенных.")
+
+@channel_group.command(name='удалить', aliases=['remove'])
+@commands.has_permissions(administrator=True)
+async def channel_remove(ctx):
+    """Удалить текущий канал из списка разрешенных"""
+    guild_id = ctx.guild.id
+    channel_id = ctx.channel.id
+    
+    if guild_id in ALLOWED_CHANNELS and channel_id in ALLOWED_CHANNELS[guild_id]:
+        ALLOWED_CHANNELS[guild_id].remove(channel_id)
+        await ctx.reply(f"✅ Канал {ctx.channel.mention} удален из списка разрешенных.")
+    else:
+        await ctx.reply(f"ℹ️ Канал {ctx.channel.mention} не находится в списке разрешенных.")
+
+@channel_group.command(name='список', aliases=['list'])
+async def channel_list(ctx):
+    """Показать список разрешенных каналов"""
+    guild_id = ctx.guild.id
+    
+    if guild_id not in ALLOWED_CHANNELS or not ALLOWED_CHANNELS[guild_id]:
+        await ctx.reply("📋 Бот работает во всех каналах (список разрешенных каналов пуст).")
+        return
+    
+    embed = discord.Embed(
+        title="📋 Разрешенные каналы для команд бота",
+        color=0x00ff00
+    )
+    
+    channel_mentions = []
+    for channel_id in ALLOWED_CHANNELS[guild_id]:
+        channel = ctx.guild.get_channel(channel_id)
+        if channel:
+            channel_mentions.append(channel.mention)
+        else:
+            channel_mentions.append(f"Удаленный канал (ID: {channel_id})")
+    
+    embed.description = "\n".join(channel_mentions) if channel_mentions else "Нет разрешенных каналов"
+    embed.set_footer(text="Бот будет отвечать на команды только в этих каналах")
+    
+    await ctx.reply(embed=embed)
+
+@channel_group.command(name='сброс', aliases=['reset'])
+@commands.has_permissions(administrator=True)
+async def channel_reset(ctx):
+    """Сбросить список разрешенных каналов (разрешить все каналы)"""
+    guild_id = ctx.guild.id
+    
+    if guild_id in ALLOWED_CHANNELS:
+        ALLOWED_CHANNELS[guild_id] = []
+    
+    await ctx.reply("✅ Список разрешенных каналов сброшен. Бот теперь работает во всех каналах!")
+
+@bot.event
+async def on_command_error(ctx, error):
+    """Обработка ошибок команд"""
+    if isinstance(error, commands.CommandNotFound):
+        # Проверяем разрешенные каналы только для существующих команд
+        if is_channel_allowed(ctx):
+            await ctx.reply(PHRASES['unknown'])
+    elif isinstance(error, commands.MissingPermissions):
+        if is_channel_allowed(ctx):
+            await ctx.reply("❌ У вас нет прав администратора для выполнения этой команды.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        if is_channel_allowed(ctx):
+            await ctx.reply("❌ Не хватает аргументов для команды. Используйте `!помощь` для справки.")
+    else:
+        if is_channel_allowed(ctx):
+            await ctx.reply(PHRASES['error'])
+            print(f"Ошибка команды: {error}")
+
+@bot.event
+async def on_message(message):
+    """Обработка сообщений"""
+    # Игнорируем сообщения от ботов
+    if message.author.bot:
+        return
+    
+    # Проверяем, разрешен ли канал для команд
+    if message.content.startswith('!'):
+        # Создаем контекст для проверки канала
+        ctx = await bot.get_context(message)
+        if not is_channel_allowed(ctx):
+            return  # Игнорируем команды в неразрешенных каналах
+    
+    # Обрабатываем команды
+    await bot.process_commands(message)
+    
+    # Реагируем на упоминания (только в разрешенных каналах)
+    if bot.user.mentioned_in(message):
+        ctx = await bot.get_context(message)
+        if is_channel_allowed(ctx):
+            await message.add_reaction('👋')
+
+@bot.command(name='помощь')
+async def help_command(ctx):
+    """Показать справку"""
+    embed = discord.Embed(
+        title="📋 Справка по командам",
+        description=PHRASES['help'],
+        color=0x00ff00
+    )
+    embed.set_footer(text="Бот создан для общения на русском языке")
+    await ctx.reply(embed=embed)
+
+if __name__ == "__main__":
+    # Запуск бота
+    token = os.getenv('DISCORD_TOKEN')
+    if not token:
+        print("Ошибка: DISCORD_TOKEN не найден в .env файле!")
+    else:
+        try:
+            bot.run(token)
+        except Exception as e:
+            print(f"Ошибка запуска бота: {e}")f"💰 Индекс: **{price:,.2f}**\n"
+                result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+                result += f"🏛️ Фондовый рынок США\n"
+                result += f"📈 [TradingView]({get_tradingview_link('nasdaq')})\n\n"
+                continue
+        
+        # Обычные криптовалюты
+        coin_id = CRYPTO_SYMBOLS.get(symbol_lower, symbol_lower)
+        
+        # Ищем данные по разным ключам
+        data_key = None
+        if coin_id in crypto_data:
+            data_key = coin_id
+        else:
+            # Ищем по всем ключам в crypto_data
+            for key in crypto_data.keys():
+                if key != 'btc.d' and key != 'nasdaq':
+                    if crypto_data[key].get('original_symbol', '').lower() == symbol_lower:
+                        data_key = key
+                        break
+        
+        if data_key:
+            data = crypto_data[data_key]
+            price = data.get('usd', 0)
+            change_24h = data.get('usd_24h_change', 0)
+            market_cap = data.get('usd_market_cap', 0)
+            
+            # Определяем эмодзи для изменения цены
+            if change_24h > 0:
+                change_emoji = "📈"
+                change_color = "+"
+            elif change_24h < 0:
+                change_emoji = "📉"
+                change_color = ""
+            else:
+                change_emoji = "➡️"
+                change_color = ""
+            
+            # Форматирование цены
+            if symbol_lower in ['btc', 'eth']:
+                price_str = f"${price:,.2f}" if price >= 1 else f"${price:.6f}"
+            else:
+                price_str = f"${price:,.4f}" if price >= 1 else f"${price:.8f}"
+            
+            # Форматирование рыночной капитализации
+            if market_cap >= 1_000_000_000:
+                market_cap_str = f"${market_cap/1_000_000_000:.1f}B"
+            elif market_cap >= 1_000_000:
+                market_cap_str = f"${market_cap/1_000_000:.1f}M"
+            elif market_cap > 0:
+                market_cap_str = f"${market_cap:,.0f}"
+            else:
+                market_cap_str = "N/A"
+            
+            result += f"**{symbol.upper()}** {change_emoji}\n"
+            result += f"💰 Цена: **{price_str}**\n"
+            result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+            if market_cap > 0:
+                result += f"🏦 Кап: **{market_cap_str}**\n"
+            result += f"📈 [TradingView]({get_tradingview_link(symbol)})\n\n"
+    
+    return result.strip() if result else "❌ Данные недоступны"f"💰 Индекс: **{price:,.2f}**\n"
+                result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+                result += f"🏛️ Фондовый рынок США\n"
+                result += f"📈 [TradingView]({get_tradingview_link('nasdaq')})\n\n"
+                continue
+        
+        # Обычные криптовалюты
+        # Сначала пробуем найти по предопределенному ID
+        coin_id = CRYPTO_SYMBOLS.get(symbol_lower, symbol_lower)
+        
+        # Если не нашли по предопределенному ID, ищем среди всех ключей
+        data_key = None
+        if coin_id in crypto_data:
+            data_key = coin_id
+        else:
+            # Ищем по всем ключам в crypto_data
+            for key in crypto_data.keys():
+                if key != 'btc.d' and key != 'nasdaq':
+                    # Проверяем, соответствует ли оригинальный символ
+                    if crypto_data[key].get('original_symbol', '').lower() == symbol_lower:
+                        data_key = key
+                        break
+        
+        if data_key:
+            data = crypto_data[data_key]
+            price = data.get('usd', 0)
+            change_24h = data.get('usd_24h_change', 0)
+            market_cap = data.get('usd_market_cap', 0)
+            
+            # Определяем эмодзи для изменения цены
+            if change_24h > 0:
+                change_emoji = "📈"
+                change_color = "+"
+            elif change_24h < 0:
+                change_emoji = "📉"
+                change_color = ""
+            else:
+                change_emoji = "➡️"
+                change_color = ""
+            
+            # Специальное форматирование для разных типов активов
+            if symbol_lower in ['btc', 'eth']:
+                # Основные криптовалюты
+                if price >= 1:
+                    price_str = f"${price:,.2f}"
+                else:
+                    price_str = f"${price:.6f}"
+            else:
+                # Альткоины
+                if price >= 1:
+                    price_str = f"${price:,.4f}"
+                else:
+                    price_str = f"${price:.8f}"
+            
+            # Форматируем рыночную капитализацию
+            if market_cap >= 1_000_000_000:
+                market_cap_str = f"${market_cap/1_000_000_000:.1f}B"
+            elif market_cap >= 1_000_000:
+                market_cap_str = f"${market_cap/1_000_000:.1f}M"
+            elif market_cap > 0:
+                market_cap_str = f"${market_cap:,.0f}"
+            else:
+                market_cap_str = "N/A"
+            
+            result += f"**{symbol.upper()}** {change_emoji}\n"
+            result += f"💰 Цена: **{price_str}**\n"
+            result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+            if market_cap > 0:
+                result += f"🏦 Кап: **{market_cap_str}**\n"
+            result += f"📈 [TradingView]({get_tradingview_link(symbol)})\n\n"
+    
+    return result.strip() if result else "❌ Данные недоступны"
+
+@bot.command(name='крипта', aliases=['crypto'])
+async def crypto_command(ctx, *symbols):
+    """Показать информацию о криптовалютах"""
+    try:
+        if not symbols:
+            # Показать основные криптовалюты и индексы (ваш список)
+            default_symbols = ['btc.d', 'nasdaq', 'btc', 'eth', 'crv']
+            crypto_data = await get_crypto_data(default_symbols)
+            
+            if crypto_data:
+                embed = discord.Embed(
+                    title="💰 Основные криптовалюты",
+                    color=0xF7931A
+                )
+                
+                formatted_data = format_crypto_data(crypto_data, default_symbols)
+                embed.description = formatted_data
+                embed.set_footer(text="Данные предоставлены CoinGecko • Обновляется в реальном времени")
+                
+                await ctx.reply(embed=embed)
+            else:
+                await ctx.reply("❌ Не удалось получить данные о криптовалютах.")
+        else:
+            # Показать конкретные криптовалюты
+            crypto_data = await get_crypto_data(list(symbols))
+            
+            if crypto_data:
+                embed = discord.Embed(
+                    title="💰 Криптовалюты",
+                    color=0xF7931A
+                )
+                
+                formatted_data = format_crypto_data(crypto_data, symbols)
+                embed.description = formatted_data
+                embed.set_footer(text="Данные предоставлены CoinGecko • Обновляется в реальном времени")
+                
+                await ctx.reply(embed=embed)
+            else:
+                await ctx.reply("❌ Не удалось найти указанные криптовалюты. Проверьте символы.")
+                
+    except Exception as e:
+        await ctx.reply("❌ Произошла ошибка при получении данных о криптовалютах.")
+        print(f"Ошибка в команде крипта: {e}")
+
+@bot.command(name='привет', aliases=['hello'])
+async def hello(ctx):
+    """Поздороваться с ботом"""
+    await ctx.reply(PHRASES['hello'])
+
+@bot.command(name='пока', aliases=['bye'])
+async def goodbye(ctx):
+    """Попрощаться с ботом"""
+    await ctx.reply(PHRASES['goodbye'])
+
+def is_channel_allowed(ctx):
+    """Проверить, разрешен ли канал для выполнения команд"""
+    guild_id = ctx.guild.id if ctx.guild else None
+    
+    # Если сервер не настроен, разрешаем все каналы
+    if guild_id not in ALLOWED_CHANNELS:
+        return True
+    
+    # Если список пустой, разрешаем все каналы
+    if not ALLOWED_CHANNELS[guild_id]:
+        return True
+    
+    # Проверяем, есть ли текущий канал в списке разрешенных
+    return ctx.channel.id in ALLOWED_CHANNELS[guild_id]
+
+@bot.group(name='канал', aliases=['channel'], invoke_without_command=True)
+async def channel_group(ctx):
+    """Группа команд для управления разрешенными каналами"""
+    await ctx.send("Используйте `!канал добавить`, `!канал удалить`, `!канал список` или `!канал сброс`")
+
+@channel_group.command(name='добавить', aliases=['add'])
+@commands.has_permissions(administrator=True)
+async def channel_add(ctx):
+    """Добавить текущий канал в список разрешенных"""
+    guild_id = ctx.guild.id
+    channel_id = ctx.channel.id
+    
+    if guild_id not in ALLOWED_CHANNELS:
+        ALLOWED_CHANNELS[guild_id] = []
+    
+    if channel_id not in ALLOWED_CHANNELS[guild_id]:
+        ALLOWED_CHANNELS[guild_id].append(channel_id)
+        await ctx.reply(f"✅ Канал {ctx.channel.mention} добавлен в список разрешенных для команд бота!")
+    else:
+        await ctx.reply(f"ℹ️ Канал {ctx.channel.mention} уже находится в списке разрешенных.")
+
+@channel_group.command(name='удалить', aliases=['remove'])
+@commands.has_permissions(administrator=True)
+async def channel_remove(ctx):
+    """Удалить текущий канал из списка разрешенных"""
+    guild_id = ctx.guild.id
+    channel_id = ctx.channel.id
+    
+    if guild_id in ALLOWED_CHANNELS and channel_id in ALLOWED_CHANNELS[guild_id]:
+        ALLOWED_CHANNELS[guild_id].remove(channel_id)
+        await ctx.reply(f"✅ Канал {ctx.channel.mention} удален из списка разрешенных.")
+    else:
+        await ctx.reply(f"ℹ️ Канал {ctx.channel.mention} не находится в списке разрешенных.")
+
+@channel_group.command(name='список', aliases=['list'])
+async def channel_list(ctx):
+    """Показать список разрешенных каналов"""
+    guild_id = ctx.guild.id
+    
+    if guild_id not in ALLOWED_CHANNELS or not ALLOWED_CHANNELS[guild_id]:
+        await ctx.reply("📋 Бот работает во всех каналах (список разрешенных каналов пуст).")
+        return
+    
+    embed = discord.Embed(
+        title="📋 Разрешенные каналы для команд бота",
+        color=0x00ff00
+    )
+    
+    channel_mentions = []
+    for channel_id in ALLOWED_CHANNELS[guild_id]:
+        channel = ctx.guild.get_channel(channel_id)
+        if channel:
+            channel_mentions.append(channel.mention)
+        else:
+            channel_mentions.append(f"Удаленный канал (ID: {channel_id})")
+    
+    embed.description = "\n".join(channel_mentions) if channel_mentions else "Нет разрешенных каналов"
+    embed.set_footer(text="Бот будет отвечать на команды только в этих каналах")
+    
+    await ctx.reply(embed=embed)
+
+@channel_group.command(name='сброс', aliases=['reset'])
+@commands.has_permissions(administrator=True)
+async def channel_reset(ctx):
+    """Сбросить список разрешенных каналов (разрешить все каналы)"""
+    guild_id = ctx.guild.id
+    
+    if guild_id in ALLOWED_CHANNELS:
+        ALLOWED_CHANNELS[guild_id] = []
+    
+    await ctx.reply("✅ Список разрешенных каналов сброшен. Бот теперь работает во всех каналах!")
+
+@bot.event
+async def on_command_error(ctx, error):
+    """Обработка ошибок команд"""
+    if isinstance(error, commands.CommandNotFound):
+        # Проверяем разрешенные каналы только для существующих команд
+        if is_channel_allowed(ctx):
+            await ctx.reply(PHRASES['unknown'])
+    elif isinstance(error, commands.MissingPermissions):
+        if is_channel_allowed(ctx):
+            await ctx.reply("❌ У вас нет прав администратора для выполнения этой команды.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        if is_channel_allowed(ctx):
+            await ctx.reply("❌ Не хватает аргументов для команды. Используйте `!помощь` для справки.")
+    else:
+        if is_channel_allowed(ctx):
+            await ctx.reply(PHRASES['error'])
+            print(f"Ошибка команды: {error}")
+
+@bot.event
+async def on_message(message):
+    """Обработка сообщений"""
+    # Игнорируем сообщения от ботов
+    if message.author.bot:
+        return
+    
+    # Проверяем, разрешен ли канал для команд
+    if message.content.startswith('!'):
+        # Создаем контекст для проверки канала
+        ctx = await bot.get_context(message)
+        if not is_channel_allowed(ctx):
+            return  # Игнорируем команды в неразрешенных каналах
+    
+    # Обрабатываем команды
+    await bot.process_commands(message)
+    
+    # Реагируем на упоминания (только в разрешенных каналах)
+    if bot.user.mentioned_in(message):
+        ctx = await bot.get_context(message)
+        if is_channel_allowed(ctx):
+            await message.add_reaction('👋')
+
+@bot.command(name='помощь')
+async def help_command(ctx):
+    """Показать справку"""
+    embed = discord.Embed(
+        title="📋 Справка по командам",
+        description=PHRASES['help'],
+        color=0x00ff00
+    )
+    embed.set_footer(text="Бот создан для общения на русском языке")
+    await ctx.reply(embed=embed)
+
+if __name__ == "__main__":
+    # Запуск бота
+    token = os.getenv('DISCORD_TOKEN')
+    if not token:
+        print("Ошибка: DISCORD_TOKEN не найден в .env файле!")
+    else:
+        try:
+            bot.run(token)
+        except Exception as e:
+            print(f"Ошибка запуска бота: {e}")f"💰 Индекс: **{price:,.2f}**\n"
+                result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+                result += f"🏛️ Фондовый рынок США\n"
+                result += f"📈 [TradingView]({get_tradingview_link('nasdaq')})\n\n"
+                continue
+        
+        # Обычные криптовалюты
+        # Сначала пробуем найти по предопределенному ID
+        coin_id = CRYPTO_SYMBOLS.get(symbol_lower, symbol_lower)
+        
+        # Если не нашли по предопределенному ID, ищем среди всех ключей
+        data_key = None
+        if coin_id in crypto_data:
+            data_key = coin_id
+        else:
+            # Ищем по всем ключам в crypto_data
+            for key in crypto_data.keys():
+                if key != 'btc.d' and key != 'nasdaq':
+                    # Проверяем, соответствует ли оригинальный символ
+                    if crypto_data[key].get('original_symbol', '').lower() == symbol_lower:
+                        data_key = key
+                        break
+        
+        if data_key:
+            data = crypto_data[data_key]
+            price = data.get('usd', 0)
+            change_24h = data.get('usd_24h_change', 0)
+            market_cap = data.get('usd_market_cap', 0)
+            
+            # Определяем эмодзи для изменения цены
+            if change_24h > 0:
+                change_emoji = "📈"
+                change_color = "+"
+            elif change_24h < 0:
+                change_emoji = "📉"
+                change_color = ""
+            else:
+                change_emoji = "➡️"
+                change_color = ""
+            
+            # Специальное форматирование для разных типов активов
+            if symbol_lower in ['btc', 'eth']:
+                # Основные криптовалюты
+                if price >= 1:
+                    price_str = f"${price:,.2f}"
+                else:
+                    price_str = f"${price:.6f}"
+            else:
+                # Альткоины
+                if price >= 1:
+                    price_str = f"${price:,.4f}"
+                else:
+                    price_str = f"${price:.8f}"
+            
+            # Форматируем рыночную капитализацию
+            if market_cap >= 1_000_000_000:
+                market_cap_str = f"${market_cap/1_000_000_000:.1f}B"
+            elif market_cap >= 1_000_000:
+                market_cap_str = f"${market_cap/1_000_000:.1f}M"
+            elif market_cap > 0:
+                market_cap_str = f"${market_cap:,.0f}"
+            else:
+                market_cap_str = "N/A"
+            
+            result += f"**{symbol.upper()}** {change_emoji}\n"
+            result += f"💰 Цена: **{price_str}**\n"
+            result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+            if market_cap > 0:
+                result += f"🏦 Кап: **{market_cap_str}**\n"
+            result += f"📈 [TradingView]({get_tradingview_link(symbol)})\n\n"
+    
+    return result.strip() if result else "❌ Данные недоступны"f"💰 Индекс: **{price:,.2f}**\n"
+                result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+                result += f"🏛️ Фондовый рынок США\n"
+                result += f"📈 [TradingView]({get_tradingview_link('nasdaq')})\n\n"
+                continue
+        
+        # Обычные криптовалюты
+        # Сначала пробуем найти по предопределенному ID
+        coin_id = CRYPTO_SYMBOLS.get(symbol_lower, symbol_lower)
+        
+        # Если не нашли по предопределенному ID, ищем среди всех ключей
+        data_key = None
+        if coin_id in crypto_data:
+            data_key = coin_id
+        else:
+            # Ищем по всем ключам в crypto_data
+            for key in crypto_data.keys():
+                if key != 'btc.d' and key != 'nasdaq':
+                    # Проверяем, соответствует ли оригинальный символ
+                    if crypto_data[key].get('original_symbol', '').lower() == symbol_lower:
+                        data_key = key
+                        break
+        
+        if data_key:
+            data = crypto_data[data_key]
+            price = data.get('usd', 0)
+            change_24h = data.get('usd_24h_change', 0)
+            market_cap = data.get('usd_market_cap', 0)
+            
+            # Определяем эмодзи для изменения цены
+            if change_24h > 0:
+                change_emoji = "📈"
+                change_color = "+"
+            elif change_24h < 0:
+                change_emoji = "📉"
+                change_color = ""
+            else:
+                change_emoji = "➡️"
+                change_color = ""
+            
+            # Специальное форматирование для разных типов активов
+            if symbol_lower in ['btc', 'eth']:
+                # Основные криптовалюты
+                if price >= 1:
+                    price_str = f"${price:,.2f}"
+                else:
+                    price_str = f"${price:.6f}"
+            else:
+                # Альткоины
+                if price >= 1:
+                    price_str = f"${price:,.4f}"
+                else:
+                    price_str = f"${price:.8f}"
+            
+            # Форматируем рыночную капитализацию
+            if market_cap >= 1_000_000_000:
+                market_cap_str = f"${market_cap/1_000_000_000:.1f}B"
+            elif market_cap >= 1_000_000:
+                market_cap_str = f"${market_cap/1_000_000:.1f}M"
+            elif market_cap > 0:
+                market_cap_str = f"${market_cap:,.0f}"
+            else:
+                market_cap_str = "N/A"
+            
+            result += f"**{symbol.upper()}** {change_emoji}\n"
+            result += f"💰 Цена: **{price_str}**\n"
+            result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+            if market_cap > 0:
+                result += f"🏦 Кап: **{market_cap_str}**\n"
+            result += f"📈 [TradingView]({get_tradingview_link(symbol)})\n\n"
+    
+    return result.strip() if result else "❌ Данные недоступны"
+
+@bot.command(name='крипта', aliases=['crypto'])
+async def crypto_command(ctx, *symbols):
+    """Показать информацию о криптовалютах"""
+    try:
+        if not symbols:
+            # Показать основные криптовалюты и индексы (ваш список)
+            default_symbols = ['btc.d', 'nasdaq', 'btc', 'eth', 'crv']
+            crypto_data = await get_crypto_data(default_symbols)
+            
+            if crypto_data:
+                embed = discord.Embed(
+                    title="💰 Основные криптовалюты",
+                    color=0xF7931A
+                )
+                
+                formatted_data = format_crypto_data(crypto_data, default_symbols)
+                embed.description = formatted_data
+                embed.set_footer(text="Данные предоставлены CoinGecko • Обновляется в реальном времени")
+                
+                await ctx.reply(embed=embed)
+            else:
+                await ctx.reply("❌ Не удалось получить данные о криптовалютах.")
+        else:
+            # Показать конкретные криптовалюты
+            crypto_data = await get_crypto_data(list(symbols))
+            
+            if crypto_data:
+                embed = discord.Embed(
+                    title="💰 Криптовалюты",
+                    color=0xF7931A
+                )
+                
+                formatted_data = format_crypto_data(crypto_data, symbols)
+                embed.description = formatted_data
+                embed.set_footer(text="Данные предоставлены CoinGecko • Обновляется в реальном времени")
+                
+                await ctx.reply(embed=embed)
+            else:
+                await ctx.reply("❌ Не удалось найти указанные криптовалюты. Проверьте символы.")
+                
+    except Exception as e:
+        await ctx.reply("❌ Произошла ошибка при получении данных о криптовалютах.")
+        print(f"Ошибка в команде крипта: {e}")
+
+@bot.command(name='привет', aliases=['hello'])
+async def hello(ctx):
+    """Поздороваться с ботом"""
+    await ctx.reply(PHRASES['hello'])
+
+@bot.command(name='пока', aliases=['bye'])
+async def goodbye(ctx):
+    """Попрощаться с ботом"""
+    await ctx.reply(PHRASES['goodbye'])
+
+def is_channel_allowed(ctx):
+    """Проверить, разрешен ли канал для выполнения команд"""
+    guild_id = ctx.guild.id if ctx.guild else None
+    
+    # Если сервер не настроен, разрешаем все каналы
+    if guild_id not in ALLOWED_CHANNELS:
+        return True
+    
+    # Если список пустой, разрешаем все каналы
+    if not ALLOWED_CHANNELS[guild_id]:
+        return True
+    
+    # Проверяем, есть ли текущий канал в списке разрешенных
+    return ctx.channel.id in ALLOWED_CHANNELS[guild_id]
+
+@bot.group(name='канал', aliases=['channel'], invoke_without_command=True)
+async def channel_group(ctx):
+    """Группа команд для управления разрешенными каналами"""
+    await ctx.send("Используйте `!канал добавить`, `!канал удалить`, `!канал список` или `!канал сброс`")
+
+@channel_group.command(name='добавить', aliases=['add'])
+@commands.has_permissions(administrator=True)
+async def channel_add(ctx):
+    """Добавить текущий канал в список разрешенных"""
+    guild_id = ctx.guild.id
+    channel_id = ctx.channel.id
+    
+    if guild_id not in ALLOWED_CHANNELS:
+        ALLOWED_CHANNELS[guild_id] = []
+    
+    if channel_id not in ALLOWED_CHANNELS[guild_id]:
+        ALLOWED_CHANNELS[guild_id].append(channel_id)
+        await ctx.reply(f"✅ Канал {ctx.channel.mention} добавлен в список разрешенных для команд бота!")
+    else:
+        await ctx.reply(f"ℹ️ Канал {ctx.channel.mention} уже находится в списке разрешенных.")
+
+@channel_group.command(name='удалить', aliases=['remove'])
+@commands.has_permissions(administrator=True)
+async def channel_remove(ctx):
+    """Удалить текущий канал из списка разрешенных"""
+    guild_id = ctx.guild.id
+    channel_id = ctx.channel.id
+    
+    if guild_id in ALLOWED_CHANNELS and channel_id in ALLOWED_CHANNELS[guild_id]:
+        ALLOWED_CHANNELS[guild_id].remove(channel_id)
+        await ctx.reply(f"✅ Канал {ctx.channel.mention} удален из списка разрешенных.")
+    else:
+        await ctx.reply(f"ℹ️ Канал {ctx.channel.mention} не находится в списке разрешенных.")
+
+@channel_group.command(name='список', aliases=['list'])
+async def channel_list(ctx):
+    """Показать список разрешенных каналов"""
+    guild_id = ctx.guild.id
+    
+    if guild_id not in ALLOWED_CHANNELS or not ALLOWED_CHANNELS[guild_id]:
+        await ctx.reply("📋 Бот работает во всех каналах (список разрешенных каналов пуст).")
+        return
+    
+    embed = discord.Embed(
+        title="📋 Разрешенные каналы для команд бота",
+        color=0x00ff00
+    )
+    
+    channel_mentions = []
+    for channel_id in ALLOWED_CHANNELS[guild_id]:
+        channel = ctx.guild.get_channel(channel_id)
+        if channel:
+            channel_mentions.append(channel.mention)
+        else:
+            channel_mentions.append(f"Удаленный канал (ID: {channel_id})")
+    
+    embed.description = "\n".join(channel_mentions) if channel_mentions else "Нет разрешенных каналов"
+    embed.set_footer(text="Бот будет отвечать на команды только в этих каналах")
+    
+    await ctx.reply(embed=embed)
+
+@channel_group.command(name='сброс', aliases=['reset'])
+@commands.has_permissions(administrator=True)
+async def channel_reset(ctx):
+    """Сбросить список разрешенных каналов (разрешить все каналы)"""
+    guild_id = ctx.guild.id
+    
+    if guild_id in ALLOWED_CHANNELS:
+        ALLOWED_CHANNELS[guild_id] = []
+    
+    await ctx.reply("✅ Список разрешенных каналов сброшен. Бот теперь работает во всех каналах!")
+
+@bot.event
+async def on_command_error(ctx, error):
+    """Обработка ошибок команд"""
+    if isinstance(error, commands.CommandNotFound):
+        # Проверяем разрешенные каналы только для существующих команд
+        if is_channel_allowed(ctx):
+            await ctx.reply(PHRASES['unknown'])
+    elif isinstance(error, commands.MissingPermissions):
+        if is_channel_allowed(ctx):
+            await ctx.reply("❌ У вас нет прав администратора для выполнения этой команды.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        if is_channel_allowed(ctx):
+            await ctx.reply("❌ Не хватает аргументов для команды. Используйте `!помощь` для справки.")
+    else:
+        if is_channel_allowed(ctx):
+            await ctx.reply(PHRASES['error'])
+            print(f"Ошибка команды: {error}")
+
+@bot.event
+async def on_message(message):
+    """Обработка сообщений"""
+    # Игнорируем сообщения от ботов
+    if message.author.bot:
+        return
+    
+    # Проверяем, разрешен ли канал для команд
+    if message.content.startswith('!'):
+        # Создаем контекст для проверки канала
+        ctx = await bot.get_context(message)
+        if not is_channel_allowed(ctx):
+            return  # Игнорируем команды в неразрешенных каналах
+    
+    # Обрабатываем команды
+    await bot.process_commands(message)
+    
+    # Реагируем на упоминания (только в разрешенных каналах)
+    if bot.user.mentioned_in(message):
+        ctx = await bot.get_context(message)
+        if is_channel_allowed(ctx):
+            await message.add_reaction('👋')
+
+@bot.command(name='помощь')
+async def help_command(ctx):
+    """Показать справку"""
+    embed = discord.Embed(
+        title="📋 Справка по командам",
+        description=PHRASES['help'],
+        color=0x00ff00
+    )
+    embed.set_footer(text="Бот создан для общения на русском языке")
+    await ctx.reply(embed=embed)
+
+if __name__ == "__main__":
+    # Запуск бота
+    token = os.getenv('DISCORD_TOKEN')
+    if not token:
+        print("Ошибка: DISCORD_TOKEN не найден в .env файле!")
+    else:
+        try:
+            bot.run(token)
+        except Exception as e:
+            print(f"Ошибка запуска бота: {e}")f"💰 Индекс: **{price:,.2f}**\n"
+                result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+                result += f"🏛️ Фондовый рынок США\n"
+                result += f"📈 [TradingView]({get_tradingview_link('nasdaq')})\n\n"
+                continue
+        
+        # Обычные криптовалюты
+        # Сначала пробуем найти по предопределенному ID
+        coin_id = CRYPTO_SYMBOLS.get(symbol_lower, symbol_lower)
+        
+        # Если не нашли по предопределенному ID, ищем среди всех ключей
+        data_key = None
+        if coin_id in crypto_data:
+            data_key = coin_id
+        else:
+            # Ищем по всем ключам в crypto_data
+            for key in crypto_data.keys():
+                if key != 'btc.d' and key != 'nasdaq':
+                    # Проверяем, соответствует ли оригинальный символ
+                    if crypto_data[key].get('original_symbol', '').lower() == symbol_lower:
+                        data_key = key
+                        break
+        
+        if data_key:
+            data = crypto_data[data_key]
+            price = data.get('usd', 0)
+            change_24h = data.get('usd_24h_change', 0)
+            market_cap = data.get('usd_market_cap', 0)
+            
+            # Определяем эмодзи для изменения цены
+            if change_24h > 0:
+                change_emoji = "📈"
+                change_color = "+"
+            elif change_24h < 0:
+                change_emoji = "📉"
+                change_color = ""
+            else:
+                change_emoji = "➡️"
+                change_color = ""
+            
+            # Специальное форматирование для разных типов активов
+            if symbol_lower in ['btc', 'eth']:
+                # Основные криптовалюты
+                if price >= 1:
+                    price_str = f"${price:,.2f}"
+                else:
+                    price_str = f"${price:.6f}"
+            else:
+                # Альткоины
+                if price >= 1:
+                    price_str = f"${price:,.4f}"
+                else:
+                    price_str = f"${price:.8f}"
+            
+            # Форматируем рыночную капитализацию
+            if market_cap >= 1_000_000_000:
+                market_cap_str = f"${market_cap/1_000_000_000:.1f}B"
+            elif market_cap >= 1_000_000:
+                market_cap_str = f"${market_cap/1_000_000:.1f}M"
+            elif market_cap > 0:
+                market_cap_str = f"${market_cap:,.0f}"
+            else:
+                market_cap_str = "N/A"
+            
+            result += f"**{symbol.upper()}** {change_emoji}\n"
+            result += f"💰 Цена: **{price_str}**\n"
+            result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+            if market_cap > 0:
+                result += f"🏦 Кап: **{market_cap_str}**\n"
+            result += f"📈 [TradingView]({get_tradingview_link(symbol)})\n\n"
+    
+    return result.strip() if result else "❌ Данные недоступны"f"💰 Индекс: **{price:,.2f}**\n"
+                result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+                result += f"🏛️ Фондовый рынок США\n"
+                result += f"📈 [TradingView]({get_tradingview_link('nasdaq')})\n\n"
+                continue
+        
+        # Обычные криптовалюты
+        # Сначала пробуем найти по предопределенному ID
+        coin_id = CRYPTO_SYMBOLS.get(symbol_lower, symbol_lower)
+        
+        # Если не нашли по предопределенному ID, ищем среди всех ключей
+        data_key = None
+        if coin_id in crypto_data:
+            data_key = coin_id
+        else:
+            # Ищем по всем ключам в crypto_data
+            for key in crypto_data.keys():
+                if key != 'btc.d' and key != 'nasdaq':
+                    # Проверяем, соответствует ли оригинальный символ
+                    if crypto_data[key].get('original_symbol', '').lower() == symbol_lower:
+                        data_key = key
+                        break
+        
+        if data_key:
+            data = crypto_data[data_key]
+            price = data.get('usd', 0)
+            change_24h = data.get('usd_24h_change', 0)
+            market_cap = data.get('usd_market_cap', 0)
+            
+            # Определяем эмодзи для изменения цены
+            if change_24h > 0:
+                change_emoji = "📈"
+                change_color = "+"
+            elif change_24h < 0:
+                change_emoji = "📉"
+                change_color = ""
+            else:
+                change_emoji = "➡️"
+                change_color = ""
+            
+            # Специальное форматирование для разных типов активов
+            if symbol_lower in ['btc', 'eth']:
+                # Основные криптовалюты
+                if price >= 1:
+                    price_str = f"${price:,.2f}"
+                else:
+                    price_str = f"${price:.6f}"
+            else:
+                # Альткоины
+                if price >= 1:
+                    price_str = f"${price:,.4f}"
+                else:
+                    price_str = f"${price:.8f}"
+            
+            # Форматируем рыночную капитализацию
+            if market_cap >= 1_000_000_000:
+                market_cap_str = f"${market_cap/1_000_000_000:.1f}B"
+            elif market_cap >= 1_000_000:
+                market_cap_str = f"${market_cap/1_000_000:.1f}M"
+            elif market_cap > 0:
+                market_cap_str = f"${market_cap:,.0f}"
+            else:
+                market_cap_str = "N/A"
+            
+            result += f"**{symbol.upper()}** {change_emoji}\n"
+            result += f"💰 Цена: **{price_str}**\n"
+            result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+            if market_cap > 0:
+                result += f"🏦 Кап: **{market_cap_str}**\n"
+            result += f"📈 [TradingView]({get_tradingview_link(symbol)})\n\n"
+    
+    return result.strip() if result else "❌ Данные недоступны"
+
+@bot.command(name='крипта', aliases=['crypto'])
+async def crypto_command(ctx, *symbols):
+    """Показать информацию о криптовалютах"""
+    try:
+        if not symbols:
+            # Показать основные криптовалюты и индексы (ваш список)
+            default_symbols = ['btc.d', 'nasdaq', 'btc', 'eth', 'crv']
+            crypto_data = await get_crypto_data(default_symbols)
+            
+            if crypto_data:
+                embed = discord.Embed(
+                    title="💰 Основные криптовалюты",
+                    color=0xF7931A
+                )
+                
+                formatted_data = format_crypto_data(crypto_data, default_symbols)
+                embed.description = formatted_data
+                embed.set_footer(text="Данные предоставлены CoinGecko • Обновляется в реальном времени")
+                
+                await ctx.reply(embed=embed)
+            else:
+                await ctx.reply("❌ Не удалось получить данные о криптовалютах.")
+        else:
+            # Показать конкретные криптовалюты
+            crypto_data = await get_crypto_data(list(symbols))
+            
+            if crypto_data:
+                embed = discord.Embed(
+                    title="💰 Криптовалюты",
+                    color=0xF7931A
+                )
+                
+                formatted_data = format_crypto_data(crypto_data, symbols)
+                embed.description = formatted_data
+                embed.set_footer(text="Данные предоставлены CoinGecko • Обновляется в реальном времени")
+                
+                await ctx.reply(embed=embed)
+            else:
+                await ctx.reply("❌ Не удалось найти указанные криптовалюты. Проверьте символы.")
+                
+    except Exception as e:
+        await ctx.reply("❌ Произошла ошибка при получении данных о криптовалютах.")
+        print(f"Ошибка в команде крипта: {e}")
+
+@bot.command(name='привет', aliases=['hello'])
+async def hello(ctx):
+    """Поздороваться с ботом"""
+    await ctx.reply(PHRASES['hello'])
+
+@bot.command(name='пока', aliases=['bye'])
+async def goodbye(ctx):
+    """Попрощаться с ботом"""
+    await ctx.reply(PHRASES['goodbye'])
+
+def is_channel_allowed(ctx):
+    """Проверить, разрешен ли канал для выполнения команд"""
+    guild_id = ctx.guild.id if ctx.guild else None
+    
+    # Если сервер не настроен, разрешаем все каналы
+    if guild_id not in ALLOWED_CHANNELS:
+        return True
+    
+    # Если список пустой, разрешаем все каналы
+    if not ALLOWED_CHANNELS[guild_id]:
+        return True
+    
+    # Проверяем, есть ли текущий канал в списке разрешенных
+    return ctx.channel.id in ALLOWED_CHANNELS[guild_id]
+
+@bot.group(name='канал', aliases=['channel'], invoke_without_command=True)
+async def channel_group(ctx):
+    """Группа команд для управления разрешенными каналами"""
+    await ctx.send("Используйте `!канал добавить`, `!канал удалить`, `!канал список` или `!канал сброс`")
+
+@channel_group.command(name='добавить', aliases=['add'])
+@commands.has_permissions(administrator=True)
+async def channel_add(ctx):
+    """Добавить текущий канал в список разрешенных"""
+    guild_id = ctx.guild.id
+    channel_id = ctx.channel.id
+    
+    if guild_id not in ALLOWED_CHANNELS:
+        ALLOWED_CHANNELS[guild_id] = []
+    
+    if channel_id not in ALLOWED_CHANNELS[guild_id]:
+        ALLOWED_CHANNELS[guild_id].append(channel_id)
+        await ctx.reply(f"✅ Канал {ctx.channel.mention} добавлен в список разрешенных для команд бота!")
+    else:
+        await ctx.reply(f"ℹ️ Канал {ctx.channel.mention} уже находится в списке разрешенных.")
+
+@channel_group.command(name='удалить', aliases=['remove'])
+@commands.has_permissions(administrator=True)
+async def channel_remove(ctx):
+    """Удалить текущий канал из списка разрешенных"""
+    guild_id = ctx.guild.id
+    channel_id = ctx.channel.id
+    
+    if guild_id in ALLOWED_CHANNELS and channel_id in ALLOWED_CHANNELS[guild_id]:
+        ALLOWED_CHANNELS[guild_id].remove(channel_id)
+        await ctx.reply(f"✅ Канал {ctx.channel.mention} удален из списка разрешенных.")
+    else:
+        await ctx.reply(f"ℹ️ Канал {ctx.channel.mention} не находится в списке разрешенных.")
+
+@channel_group.command(name='список', aliases=['list'])
+async def channel_list(ctx):
+    """Показать список разрешенных каналов"""
+    guild_id = ctx.guild.id
+    
+    if guild_id not in ALLOWED_CHANNELS or not ALLOWED_CHANNELS[guild_id]:
+        await ctx.reply("📋 Бот работает во всех каналах (список разрешенных каналов пуст).")
+        return
+    
+    embed = discord.Embed(
+        title="📋 Разрешенные каналы для команд бота",
+        color=0x00ff00
+    )
+    
+    channel_mentions = []
+    for channel_id in ALLOWED_CHANNELS[guild_id]:
+        channel = ctx.guild.get_channel(channel_id)
+        if channel:
+            channel_mentions.append(channel.mention)
+        else:
+            channel_mentions.append(f"Удаленный канал (ID: {channel_id})")
+    
+    embed.description = "\n".join(channel_mentions) if channel_mentions else "Нет разрешенных каналов"
+    embed.set_footer(text="Бот будет отвечать на команды только в этих каналах")
+    
+    await ctx.reply(embed=embed)
+
+@channel_group.command(name='сброс', aliases=['reset'])
+@commands.has_permissions(administrator=True)
+async def channel_reset(ctx):
+    """Сбросить список разрешенных каналов (разрешить все каналы)"""
+    guild_id = ctx.guild.id
+    
+    if guild_id in ALLOWED_CHANNELS:
+        ALLOWED_CHANNELS[guild_id] = []
+    
+    await ctx.reply("✅ Список разрешенных каналов сброшен. Бот теперь работает во всех каналах!")
+
+@bot.event
+async def on_command_error(ctx, error):
+    """Обработка ошибок команд"""
+    if isinstance(error, commands.CommandNotFound):
+        # Проверяем разрешенные каналы только для существующих команд
+        if is_channel_allowed(ctx):
+            await ctx.reply(PHRASES['unknown'])
+    elif isinstance(error, commands.MissingPermissions):
+        if is_channel_allowed(ctx):
+            await ctx.reply("❌ У вас нет прав администратора для выполнения этой команды.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        if is_channel_allowed(ctx):
+            await ctx.reply("❌ Не хватает аргументов для команды. Используйте `!помощь` для справки.")
+    else:
+        if is_channel_allowed(ctx):
+            await ctx.reply(PHRASES['error'])
+            print(f"Ошибка команды: {error}")
+
+@bot.event
+async def on_message(message):
+    """Обработка сообщений"""
+    # Игнорируем сообщения от ботов
+    if message.author.bot:
+        return
+    
+    # Проверяем, разрешен ли канал для команд
+    if message.content.startswith('!'):
+        # Создаем контекст для проверки канала
+        ctx = await bot.get_context(message)
+        if not is_channel_allowed(ctx):
+            return  # Игнорируем команды в неразрешенных каналах
+    
+    # Обрабатываем команды
+    await bot.process_commands(message)
+    
+    # Реагируем на упоминания (только в разрешенных каналах)
+    if bot.user.mentioned_in(message):
+        ctx = await bot.get_context(message)
+        if is_channel_allowed(ctx):
+            await message.add_reaction('👋')
+
+@bot.command(name='помощь')
+async def help_command(ctx):
+    """Показать справку"""
+    embed = discord.Embed(
+        title="📋 Справка по командам",
+        description=PHRASES['help'],
+        color=0x00ff00
+    )
+    embed.set_footer(text="Бот создан для общения на русском языке")
+    await ctx.reply(embed=embed)
+
+if __name__ == "__main__":
+    # Запуск бота
+    token = os.getenv('DISCORD_TOKEN')
+    if not token:
+        print("Ошибка: DISCORD_TOKEN не найден в .env файле!")
+    else:
+        try:
+            bot.run(token)
+        except Exception as e:
+            print(f"Ошибка запуска бота: {e}")f"💰 Индекс: **{price:,.2f}**\n"
+                result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+                result += f"🏛️ Фондовый рынок США\n"
+                result += f"📈 [TradingView]({get_tradingview_link('nasdaq')})\n\n"
+                continue
+        
+        # Обычные криптовалюты
+        # Сначала пробуем найти по предопределенному ID
+        coin_id = CRYPTO_SYMBOLS.get(symbol_lower, symbol_lower)
+        
+        # Если не нашли по предопределенному ID, ищем среди всех ключей
+        data_key = None
+        if coin_id in crypto_data:
+            data_key = coin_id
+        else:
+            # Ищем по всем ключам в crypto_data
+            for key in crypto_data.keys():
+                if key != 'btc.d' and key != 'nasdaq':
+                    # Проверяем, соответствует ли оригинальный символ
+                    if crypto_data[key].get('original_symbol', '').lower() == symbol_lower:
+                        data_key = key
+                        break
+        
+        if data_key:
+            data = crypto_data[data_key]
+            price = data.get('usd', 0)
+            change_24h = data.get('usd_24h_change', 0)
+            market_cap = data.get('usd_market_cap', 0)
+            
+            # Определяем эмодзи для изменения цены
+            if change_24h > 0:
+                change_emoji = "📈"
+                change_color = "+"
+            elif change_24h < 0:
+                change_emoji = "📉"
+                change_color = ""
+            else:
+                change_emoji = "➡️"
+                change_color = ""
+            
+            # Специальное форматирование для разных типов активов
+            if symbol_lower in ['btc', 'eth']:
+                # Основные криптовалюты
+                if price >= 1:
+                    price_str = f"${price:,.2f}"
+                else:
+                    price_str = f"${price:.6f}"
+            else:
+                # Альткоины
+                if price >= 1:
+                    price_str = f"${price:,.4f}"
+                else:
+                    price_str = f"${price:.8f}"
+            
+            # Форматируем рыночную капитализацию
+            if market_cap >= 1_000_000_000:
+                market_cap_str = f"${market_cap/1_000_000_000:.1f}B"
+            elif market_cap >= 1_000_000:
+                market_cap_str = f"${market_cap/1_000_000:.1f}M"
+            elif market_cap > 0:
+                market_cap_str = f"${market_cap:,.0f}"
+            else:
+                market_cap_str = "N/A"
+            
+            result += f"**{symbol.upper()}** {change_emoji}\n"
+            result += f"💰 Цена: **{price_str}**\n"
+            result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+            if market_cap > 0:
+                result += f"🏦 Кап: **{market_cap_str}**\n"
+            result += f"📈 [TradingView]({get_tradingview_link(symbol)})\n\n"
+    
+    return result.strip() if result else "❌ Данные недоступны"f"💰 Индекс: **{price:,.2f}**\n"
+                result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+                result += f"🏛️ Фондовый рынок США\n"
+                result += f"📈 [TradingView]({get_tradingview_link('nasdaq')})\n\n"
+                continue
+        
+        # Обычные криптовалюты
+        # Сначала пробуем найти по предопределенному ID
+        coin_id = CRYPTO_SYMBOLS.get(symbol_lower, symbol_lower)
+        
+        # Если не нашли по предопределенному ID, ищем среди всех ключей
+        data_key = None
+        if coin_id in crypto_data:
+            data_key = coin_id
+        else:
+            # Ищем по всем ключам в crypto_data
+            for key in crypto_data.keys():
+                if key != 'btc.d' and key != 'nasdaq':
+                    # Проверяем, соответствует ли оригинальный символ
+                    if crypto_data[key].get('original_symbol', '').lower() == symbol_lower:
+                        data_key = key
+                        break
+        
+        if data_key:
+            data = crypto_data[data_key]
+            price = data.get('usd', 0)
+            change_24h = data.get('usd_24h_change', 0)
+            market_cap = data.get('usd_market_cap', 0)
+            
+            # Определяем эмодзи для изменения цены
+            if change_24h > 0:
+                change_emoji = "📈"
+                change_color = "+"
+            elif change_24h < 0:
+                change_emoji = "📉"
+                change_color = ""
+            else:
+                change_emoji = "➡️"
+                change_color = ""
+            
+            # Специальное форматирование для разных типов активов
+            if symbol_lower in ['btc', 'eth']:
+                # Основные криптовалюты
+                if price >= 1:
+                    price_str = f"${price:,.2f}"
+                else:
+                    price_str = f"${price:.6f}"
+            else:
+                # Альткоины
+                if price >= 1:
+                    price_str = f"${price:,.4f}"
+                else:
+                    price_str = f"${price:.8f}"
+            
+            # Форматируем рыночную капитализацию
+            if market_cap >= 1_000_000_000:
+                market_cap_str = f"${market_cap/1_000_000_000:.1f}B"
+            elif market_cap >= 1_000_000:
+                market_cap_str = f"${market_cap/1_000_000:.1f}M"
+            elif market_cap > 0:
+                market_cap_str = f"${market_cap:,.0f}"
+            else:
+                market_cap_str = "N/A"
+            
+            result += f"**{symbol.upper()}** {change_emoji}\n"
+            result += f"💰 Цена: **{price_str}**\n"
+            result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+            if market_cap > 0:
+                result += f"🏦 Кап: **{market_cap_str}**\n"
+            result += f"📈 [TradingView]({get_tradingview_link(symbol)})\n\n"
+    
+    return result.strip() if result else "❌ Данные недоступны"
+
+@bot.command(name='крипта', aliases=['crypto'])
+async def crypto_command(ctx, *symbols):
+    """Показать информацию о криптовалютах"""
+    try:
+        if not symbols:
+            # Показать основные криптовалюты и индексы (ваш список)
+            default_symbols = ['btc.d', 'nasdaq', 'btc', 'eth', 'crv']
+            crypto_data = await get_crypto_data(default_symbols)
+            
+            if crypto_data:
+                embed = discord.Embed(
+                    title="💰 Основные криптовалюты",
+                    color=0xF7931A
+                )
+                
+                formatted_data = format_crypto_data(crypto_data, default_symbols)
+                embed.description = formatted_data
+                embed.set_footer(text="Данные предоставлены CoinGecko • Обновляется в реальном времени")
+                
+                await ctx.reply(embed=embed)
+            else:
+                await ctx.reply("❌ Не удалось получить данные о криптовалютах.")
+        else:
+            # Показать конкретные криптовалюты
+            crypto_data = await get_crypto_data(list(symbols))
+            
+            if crypto_data:
+                embed = discord.Embed(
+                    title="💰 Криптовалюты",
+                    color=0xF7931A
+                )
+                
+                formatted_data = format_crypto_data(crypto_data, symbols)
+                embed.description = formatted_data
+                embed.set_footer(text="Данные предоставлены CoinGecko • Обновляется в реальном времени")
+                
+                await ctx.reply(embed=embed)
+            else:
+                await ctx.reply("❌ Не удалось найти указанные криптовалюты. Проверьте символы.")
+                
+    except Exception as e:
+        await ctx.reply("❌ Произошла ошибка при получении данных о криптовалютах.")
+        print(f"Ошибка в команде крипта: {e}")
+
+@bot.command(name='привет', aliases=['hello'])
+async def hello(ctx):
+    """Поздороваться с ботом"""
+    await ctx.reply(PHRASES['hello'])
+
+@bot.command(name='пока', aliases=['bye'])
+async def goodbye(ctx):
+    """Попрощаться с ботом"""
+    await ctx.reply(PHRASES['goodbye'])f"💰 Индекс: **{price:,.2f}**\n"
+                result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+                result += f"🏛️ Фондовый рынок США\n"
+                result += f"📈 [TradingView]({get_tradingview_link('nasdaq')})\n\n"
+                continue
+        
+        # Обычные криптовалюты
+        # Сначала пробуем найти по предопределенному ID
+        coin_id = CRYPTO_SYMBOLS.get(symbol_lower, symbol_lower)
+        
+        # Если не нашли по предопределенному ID, ищем среди всех ключей
+        data_key = None
+        if coin_id in crypto_data:
+            data_key = coin_id
+        else:
+            # Ищем по всем ключам в crypto_data
+            for key in crypto_data.keys():
+                if key != 'btc.d' and key != 'nasdaq':
+                    # Проверяем, соответствует ли оригинальный символ
+                    if crypto_data[key].get('original_symbol', '').lower() == symbol_lower:
+                        data_key = key
+                        break
+        
+        if data_key:
+            data = crypto_data[data_key]
+            price = data.get('usd', 0)
+            change_24h = data.get('usd_24h_change', 0)
+            market_cap = data.get('usd_market_cap', 0)
+            
+            # Определяем эмодзи для изменения цены
+            if change_24h > 0:
+                change_emoji = "📈"
+                change_color = "+"
+            elif change_24h < 0:
+                change_emoji = "📉"
+                change_color = ""
+            else:
+                change_emoji = "➡️"
+                change_color = ""
+            
+            # Специальное форматирование для разных типов активов
+            if symbol_lower in ['btc', 'eth']:
+                # Основные криптовалюты
+                if price >= 1:
+                    price_str = f"${price:,.2f}"
+                else:
+                    price_str = f"${price:.6f}"
+            else:
+                # Альткоины
+                if price >= 1:
+                    price_str = f"${price:,.4f}"
+                else:
+                    price_str = f"${price:.8f}"
+            
+            # Форматируем рыночную капитализацию
+            if market_cap >= 1_000_000_000:
+                market_cap_str = f"${market_cap/1_000_000_000:.1f}B"
+            elif market_cap >= 1_000_000:
+                market_cap_str = f"${market_cap/1_000_000:.1f}M"
+            elif market_cap > 0:
+                market_cap_str = f"${market_cap:,.0f}"
+            else:
+                market_cap_str = "N/A"
+            
+            result += f"**{symbol.upper()}** {change_emoji}\n"
+            result += f"💰 Цена: **{price_str}**\n"
+            result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+            if market_cap > 0:
+                result += f"🏦 Кап: **{market_cap_str}**\n"
+            result += f"📈 [TradingView]({get_tradingview_link(symbol)})\n\n"
             data = crypto_data[coin_id]
             price = data.get('usd', 0)
             change_24h = data.get('usd_24h_change', 0)
@@ -730,7 +2693,7 @@ def format_crypto_data(crypto_data, requested_symbols):
             result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
             if market_cap > 0:
                 result += f"🏦 Кап: **{market_cap_str}**\n"
-            result += "\n"
+            result += f"📈 [TradingView]({get_tradingview_link(symbol)})\n\n"
     
     return result.strip() if result else "❌ Данные недоступны"
 
