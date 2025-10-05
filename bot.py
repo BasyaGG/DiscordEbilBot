@@ -6,6 +6,10 @@ from datetime import datetime, timedelta
 import asyncio
 import aiohttp
 import json
+import random
+import time
+import yt_dlp
+from discord import FFmpegPCMAudio, FFmpegOpusAudio
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -51,7 +55,21 @@ PHRASES = {
 • `!канал добавить` - разрешить боту работать в этом канале
 • `!канал удалить` - запретить боту работать в этом канале
 • `!канал список` - показать разрешенные каналы
-• `!канал сброс` - разрешить боту работать во всех каналах''',
+• `!канал сброс` - разрешить боту работать во всех каналах
+
+**Рандом:**
+• `!poll <число>` - выбрать случайное число от 1 до указанного
+• `!рандом <число>` - выбрать случайное число от 1 до указанного
+
+**Музыка и радио:**
+• `!join` / `!подключиться` - подключиться к голосовому каналу
+• `!play <ссылка/название>` / `!играть` - воспроизвести музыку
+• `!radio` / `!радио` - включить радио Bluford
+• `!stop` / `!стоп` - остановить воспроизведение
+• `!pause` / `!пауза` - поставить на паузу
+• `!resume` / `!продолжить` - продолжить воспроизведение
+• `!volume <0-100>` / `!громкость` - изменить громкость
+• `!leave` / `!отключиться` - отключиться от канала''',
     'time': 'Текущее время: ',
     'unknown': 'Извините, я не понимаю эту команду. Напишите `!помощь` для списка команд.',
     'error': 'Произошла ошибка при выполнении команды.',
@@ -227,7 +245,7 @@ async def weather(ctx, *, city_name=None):
                         inline=False
                     )
             
-            embed.set_footer(text="Данные предоставлены OpenWeatherMap • Используйте !погода <город> для поиска")
+            embed.set_footer(text="Данные предоставлены OpenWeatherMap • !погода <город> для поиска погоды в вашем городе")
             await ctx.reply(embed=embed)
         
     except Exception as e:
@@ -529,142 +547,325 @@ async def twitch_message(ctx, channel_input: str, *, message: str):
     else:
         await ctx.reply(f"❌ Канал '{channel_name}' не найден в списке мониторинга. Сначала добавьте его командой `!twitch добавить https://twitch.tv/{channel_name}`")
 
-# Криптовалюты API функции
-async def search_coin_id(symbol):
-    """Поиск ID монеты по символу через CoinGecko API"""
-    try:
-        url = f"https://api.coingecko.com/api/v3/search?query={symbol}"
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    coins = data.get('coins', [])
-                    
-                    # Если нашли монеты, возвращаем ID первой (наиболее релевантной)
-                    if coins:
-                        # Сначала ищем точное совпадение по символу
-                        for coin in coins:
-                            if coin.get('symbol', '').lower() == symbol.lower():
-                                return coin.get('id')
-                        
-                        # Если точного совпадения нет, берем первую из результатов
-                        return coins[0].get('id')
-        
-        return None
-    except Exception as e:
-        print(f"Ошибка при поиске ID для {symbol}: {e}")
-        return None
+# Кэш для криптовалют (в памяти)
+crypto_cache = {}
 
+# Криптовалюты API функции (CoinPaprika)
 async def get_crypto_data(symbols):
-    """Получить данные о криптовалютах через CoinGecko API"""
+    """Получить данные о криптовалютах через CoinPaprika API с кэшированием"""
     if isinstance(symbols, str):
         symbols = [symbols]
     
     results = {}
-    symbol_to_id_map = {}  # Для сохранения соответствия символа и ID
+    now = time.time()
     
     for symbol in symbols:
         symbol_lower = symbol.lower()
         
-        # Специальная обработка для BTC.D (Bitcoin Dominance)
+        # Специальная обработка для BTC.D (только ссылка)
         if symbol_lower == 'btc.d' or symbol_lower == 'btcd':
-            btc_dominance = await get_btc_dominance()
-            if btc_dominance:
-                results['btc.d'] = btc_dominance
-                symbol_to_id_map[symbol_lower] = 'btc.d'
+            results['btc.d'] = {'link_only': True}
             continue
         
-        # Специальная обработка для NASDAQ
+        # Специальная обработка для NASDAQ (только ссылка)
         if symbol_lower == 'nasdaq':
-            nasdaq_data = await get_nasdaq_data()
-            if nasdaq_data:
-                results['nasdaq'] = nasdaq_data
-                symbol_to_id_map[symbol_lower] = 'nasdaq'
+            results['nasdaq'] = {'link_only': True}
             continue
         
-        # Обычные криптовалюты
-        if symbol_lower in CRYPTO_SYMBOLS:
-            coin_id = CRYPTO_SYMBOLS[symbol_lower]
-        else:
-            # Если символ не в нашем словаре, пробуем найти его через API поиска
-            coin_id = await search_coin_id(symbol_lower)
-            if not coin_id:
-                # Если не нашли, пробуем использовать символ как ID
-                coin_id = symbol_lower
+        # Проверяем кэш для криптовалют
+        cache_key = f"crypto_{symbol_lower}"
+        if cache_key in crypto_cache:
+            cached_data, last_updated = crypto_cache[cache_key]
+            # Если прошло меньше 60 секунд - используем кэш
+            if now - last_updated < 60:
+                results[symbol_lower] = cached_data
+                continue
         
-        # Сохраняем соответствие символа и ID
-        symbol_to_id_map[symbol_lower] = coin_id
-        
-        # Получаем данные для одной криптовалюты
-        url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd&include_24hr_change=true&include_market_cap=true"
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if coin_id in data:
-                            # Сохраняем данные с оригинальным символом для отображения
-                            results[coin_id] = data[coin_id]
-                            results[coin_id]['original_symbol'] = symbol
-        except Exception as e:
-            print(f"Ошибка при получении данных для {symbol} (ID: {coin_id}): {e}")
+        # Получаем данные из API
+        coin_data = await fetch_coinpaprika_data(symbol_lower)
+        if coin_data:
+            # Сохраняем в кэш
+            crypto_cache[cache_key] = (coin_data, now)
+            results[symbol_lower] = coin_data
     
     return results if results else None
 
-async def get_btc_dominance():
-    """Получить Bitcoin Dominance с расчетом изменения за 24ч"""
+async def fetch_coinpaprika_data(symbol):
+    """Получить данные монеты из CoinPaprika API"""
     try:
-        async with aiohttp.ClientSession() as session:
-            # Получаем текущие данные
-            current_url = "https://api.coingecko.com/api/v3/global"
-            async with session.get(current_url) as response:
-                if response.status == 200:
-                    current_data = await response.json()
-                    current_dominance = current_data.get('data', {}).get('market_cap_percentage', {}).get('btc', 0)
-                    
-                    # Получаем данные BTC для расчета приблизительного изменения доминации
-                    btc_url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true"
-                    async with session.get(btc_url) as btc_response:
-                        if btc_response.status == 200:
-                            btc_data = await btc_response.json()
-                            btc_change_24h = btc_data.get('bitcoin', {}).get('usd_24h_change', 0)
-                            
-                            # Приблизительный расчет изменения доминации на основе изменения цены BTC
-                            # Если BTC растет быстрее рынка, доминация увеличивается
-                            # Это упрощенный расчет, но дает представление о тренде
-                            estimated_dominance_change = btc_change_24h * 0.1  # Коэффициент 0.1 для сглаживания
-                            
-                            return {
-                                'usd': current_dominance,
-                                'usd_24h_change': estimated_dominance_change,
-                                'usd_market_cap': 0
-                            }
-                    
-                    # Если не удалось получить данные BTC, возвращаем без изменения
-                    return {
-                        'usd': current_dominance,
-                        'usd_24h_change': 0,
-                        'usd_market_cap': 0
-                    }
-    except Exception as e:
-        print(f"Ошибка при получении Bitcoin Dominance: {e}")
-    
-    return None
-
-async def get_nasdaq_data():
-    """Получить данные NASDAQ через Yahoo Finance API"""
-    try:
-        # Используем Yahoo Finance API для получения данных NASDAQ
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/%5EIXIC"
+        # Сначала получаем ID монеты по символу
+        coin_id = await get_coinpaprika_id(symbol)
+        if not coin_id:
+            return None
+        
+        # Получаем данные о цене
+        url = f"https://api.coinpaprika.com/v1/tickers/{coin_id}"
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as response:
                 if response.status == 200:
                     data = await response.json()
                     
-                    # Извлекаем данные из ответа Yahoo Finance
+                    # Форматируем данные под наш формат
+                    quotes = data.get('quotes', {}).get('USD', {})
+                    return {
+                        'usd': quotes.get('price', 0),
+                        'usd_24h_change': quotes.get('percent_change_24h', 0),
+                        'usd_market_cap': quotes.get('market_cap', 0),
+                        'original_symbol': symbol
+                    }
+                else:
+                    print(f"CoinPaprika API error {response.status} for {symbol}")
+                    return None
+                    
+    except Exception as e:
+        print(f"Ошибка при получении данных CoinPaprika для {symbol}: {e}")
+        return None
+
+async def get_coinpaprika_id(symbol):
+    """Получить ID монеты в CoinPaprika по символу"""
+    symbol_lower = symbol.lower()
+    
+    # Маппинг популярных символов на CoinPaprika ID
+    coinpaprika_ids = {
+        'btc': 'btc-bitcoin',
+        'eth': 'eth-ethereum',
+        'usdt': 'usdt-tether',
+        'bnb': 'bnb-binance-coin',
+        'xrp': 'xrp-xrp',
+        'ada': 'ada-cardano',
+        'doge': 'doge-dogecoin',
+        'matic': 'matic-polygon',
+        'sol': 'sol-solana',
+        'dot': 'dot-polkadot',
+        'avax': 'avax-avalanche',
+        'crv': 'crv-curve-dao-token',
+        'uni': 'uni-uniswap',
+        'link': 'link-chainlink',
+        'ltc': 'ltc-litecoin',
+        'atom': 'atom-cosmos',
+        'near': 'near-near-protocol',
+        'ftm': 'ftm-fantom',
+        'algo': 'algo-algorand',
+        'icp': 'icp-internet-computer',
+        'apt': 'apt-aptos',
+        'op': 'op-optimism',
+        'arb': 'arb-arbitrum',
+        'sui': 'sui-sui'
+    }
+    
+    if symbol_lower in coinpaprika_ids:
+        return coinpaprika_ids[symbol_lower]
+    
+    # Если нет в маппинге, пробуем найти через поиск
+    try:
+        cache_key = f"search_{symbol_lower}"
+        now = time.time()
+        
+        # Проверяем кэш поиска
+        if cache_key in crypto_cache:
+            cached_id, last_updated = crypto_cache[cache_key]
+            if now - last_updated < 3600:  # Кэш поиска на 1 час
+                return cached_id
+        
+        url = f"https://api.coinpaprika.com/v1/search?q={symbol}&c=currencies&limit=10"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    currencies = data.get('currencies', [])
+                    
+                    # Ищем точное совпадение по символу
+                    for currency in currencies:
+                        if currency.get('symbol', '').lower() == symbol_lower:
+                            coin_id = currency.get('id')
+                            # Сохраняем в кэш
+                            crypto_cache[cache_key] = (coin_id, now)
+                            return coin_id
+                    
+                    # Если точного совпадения нет, берем первый результат
+                    if currencies:
+                        coin_id = currencies[0].get('id')
+                        crypto_cache[cache_key] = (coin_id, now)
+                        return coin_id
+                        
+    except Exception as e:
+        print(f"Ошибка поиска в CoinPaprika для {symbol}: {e}")
+    
+    return None
+
+async def get_btc_dominance_cached():
+    """Получить Bitcoin Dominance с кэшированием"""
+    cache_key = "btc_dominance"
+    now = time.time()
+    
+    # Проверяем кэш
+    if cache_key in crypto_cache:
+        cached_data, last_updated = crypto_cache[cache_key]
+        if now - last_updated < 300:  # Кэш на 5 минут
+            return cached_data
+    
+    # Получаем новые данные
+    dominance_data = await get_btc_dominance()
+    if dominance_data:
+        crypto_cache[cache_key] = (dominance_data, now)
+    
+    return dominance_data
+
+async def get_btc_dominance():
+    """Получить Bitcoin Dominance через несколько источников"""
+    
+    # Источник 1: CoinGecko API (более точные данные)
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = "https://api.coingecko.com/api/v3/global"
+            async with session.get(url, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    current_dominance = data.get('data', {}).get('market_cap_percentage', {}).get('btc', 0)
+                    
+                    if current_dominance > 0:
+                        # Получаем данные BTC для расчета изменения доминации
+                        btc_url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true"
+                        async with session.get(btc_url, timeout=10) as btc_response:
+                            if btc_response.status == 200:
+                                btc_data = await btc_response.json()
+                                btc_change_24h = btc_data.get('bitcoin', {}).get('usd_24h_change', 0)
+                                
+                                # Приблизительный расчет изменения доминации
+                                estimated_dominance_change = btc_change_24h * 0.05
+                                
+                                return {
+                                    'usd': current_dominance,
+                                    'usd_24h_change': estimated_dominance_change,
+                                    'usd_market_cap': 0
+                                }
+                        
+                        # Если не удалось получить изменение, возвращаем без него
+                        return {
+                            'usd': current_dominance,
+                            'usd_24h_change': 0,
+                            'usd_market_cap': 0
+                        }
+                else:
+                    print(f"CoinGecko Global API error: {response.status}")
+                    
+    except Exception as e:
+        print(f"CoinGecko BTC Dominance error: {e}")
+    
+    # Источник 2: CoinPaprika API (резервный)
+    try:
+        async with aiohttp.ClientSession() as session:
+            global_url = "https://api.coinpaprika.com/v1/global"
+            async with session.get(global_url, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    current_dominance = data.get('bitcoin_dominance_percentage', 0)
+                    
+                    if current_dominance > 0:
+                        print("Используем CoinPaprika для BTC Dominance")
+                        return {
+                            'usd': current_dominance,
+                            'usd_24h_change': 0,
+                            'usd_market_cap': 0
+                        }
+                else:
+                    print(f"CoinPaprika Global API error: {response.status}")
+                    
+    except Exception as e:
+        print(f"CoinPaprika BTC Dominance error: {e}")
+    
+    print("Все источники BTC Dominance недоступны")
+    return None
+
+async def get_nasdaq_data_cached():
+    """Получить данные NASDAQ с кэшированием"""
+    cache_key = "nasdaq_data"
+    now = time.time()
+    
+    # Проверяем кэш
+    if cache_key in crypto_cache:
+        cached_data, last_updated = crypto_cache[cache_key]
+        if now - last_updated < 300:  # Кэш на 5 минут
+            return cached_data
+    
+    # Получаем новые данные
+    nasdaq_data = await get_nasdaq_data()
+    if nasdaq_data:
+        crypto_cache[cache_key] = (nasdaq_data, now)
+    
+    return nasdaq_data
+
+async def get_nasdaq_data():
+    """Получить данные NASDAQ через несколько источников"""
+    
+    # Источник 1: Alpha Vantage API (если есть ключ)
+    alpha_vantage_key = os.getenv('ALPHA_VANTAGE_API_KEY')
+    if alpha_vantage_key:
+        try:
+            url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=IXIC&apikey={alpha_vantage_key}"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=15) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        
+                        global_quote = data.get('Global Quote', {})
+                        if global_quote:
+                            current_price = float(global_quote.get('05. price', 0))
+                            change_percent = float(global_quote.get('10. change percent', '0%').replace('%', ''))
+                            
+                            if current_price > 0:
+                                print("Используем Alpha Vantage для NASDAQ")
+                                return {
+                                    'usd': current_price,
+                                    'usd_24h_change': change_percent,
+                                    'usd_market_cap': 0
+                                }
+                            
+        except Exception as e:
+            print(f"Alpha Vantage NASDAQ error: {e}")
+    
+    # Источник 2: Finnhub API (если есть ключ)
+    finnhub_key = os.getenv('FINNHUB_API_KEY')
+    if finnhub_key:
+        try:
+            url = f"https://finnhub.io/api/v1/quote?symbol=^IXIC&token={finnhub_key}"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=15) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        
+                        current_price = data.get('c', 0)  # current price
+                        previous_close = data.get('pc', 0)  # previous close
+                        
+                        if current_price > 0 and previous_close > 0:
+                            change_24h = ((current_price - previous_close) / previous_close) * 100
+                            
+                            print("Используем Finnhub для NASDAQ")
+                            return {
+                                'usd': current_price,
+                                'usd_24h_change': change_24h,
+                                'usd_market_cap': 0
+                            }
+                            
+        except Exception as e:
+            print(f"Finnhub NASDAQ error: {e}")
+    
+    # Источник 3: Yahoo Finance (основной)
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/%5EIXIC"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=15) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
                     chart = data.get('chart', {})
                     result = chart.get('result', [])
                     
@@ -673,25 +874,86 @@ async def get_nasdaq_data():
                         current_price = meta.get('regularMarketPrice', 0)
                         previous_close = meta.get('previousClose', 0)
                         
-                        # Вычисляем изменение за день
-                        if previous_close > 0:
+                        if current_price > 0 and previous_close > 0:
                             change_24h = ((current_price - previous_close) / previous_close) * 100
-                        else:
-                            change_24h = 0
-                        
-                        return {
-                            'usd': current_price,
-                            'usd_24h_change': change_24h,
-                            'usd_market_cap': 0
-                        }
+                            
+                            print("Используем Yahoo Finance для NASDAQ")
+                            return {
+                                'usd': current_price,
+                                'usd_24h_change': change_24h,
+                                'usd_market_cap': 0
+                            }
                         
     except Exception as e:
-        print(f"Ошибка при получении данных NASDAQ: {e}")
+        print(f"Yahoo Finance NASDAQ error: {e}")
     
-    # Если не удалось получить данные, возвращаем демонстрационные
+    # Источник 4: Альтернативный Yahoo Finance endpoint
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        url = "https://query2.finance.yahoo.com/v10/finance/quoteSummary/^IXIC?modules=price"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=15) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    quote_summary = data.get('quoteSummary', {})
+                    result = quote_summary.get('result', [])
+                    
+                    if result:
+                        price_data = result[0].get('price', {})
+                        current_price = price_data.get('regularMarketPrice', {}).get('raw', 0)
+                        previous_close = price_data.get('regularMarketPreviousClose', {}).get('raw', 0)
+                        
+                        if current_price > 0 and previous_close > 0:
+                            change_24h = ((current_price - previous_close) / previous_close) * 100
+                            
+                            print("Используем альтернативный Yahoo Finance для NASDAQ")
+                            return {
+                                'usd': current_price,
+                                'usd_24h_change': change_24h,
+                                'usd_market_cap': 0
+                            }
+                        
+    except Exception as e:
+        print(f"Alternative Yahoo Finance NASDAQ error: {e}")
+    
+    # Источник 5: Marketstack API (если есть ключ)
+    marketstack_key = os.getenv('MARKETSTACK_API_KEY')
+    if marketstack_key:
+        try:
+            url = f"http://api.marketstack.com/v1/eod/latest?access_key={marketstack_key}&symbols=IXIC"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=15) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        
+                        eod_data = data.get('data', [])
+                        if eod_data:
+                            current_price = eod_data[0].get('close', 0)
+                            previous_close = eod_data[0].get('open', 0)
+                            
+                            if current_price > 0 and previous_close > 0:
+                                change_24h = ((current_price - previous_close) / previous_close) * 100
+                                
+                                print("Используем Marketstack для NASDAQ")
+                                return {
+                                    'usd': current_price,
+                                    'usd_24h_change': change_24h,
+                                    'usd_market_cap': 0
+                                }
+                            
+        except Exception as e:
+            print(f"Marketstack NASDAQ error: {e}")
+    
+    # Источник 6: Актуальные резервные данные (обновляется вручную)
+    print("Используем резервные данные NASDAQ - все API недоступны")
     return {
-        'usd': 15420.50,  # Примерное значение NASDAQ
-        'usd_24h_change': 1.25,  # Примерное изменение за день
+        'usd': 19000.00,  # Более консервативное значение
+        'usd_24h_change': 0.5,  # Примерное изменение
         'usd_market_cap': 0
     }
 
@@ -718,74 +980,25 @@ def format_crypto_data(crypto_data, requested_symbols):
     for symbol in requested_symbols:
         symbol_lower = symbol.lower()
         
-        # Специальная обработка для BTC.D
+        # Специальная обработка для BTC.D (только ссылка)
         if symbol_lower == 'btc.d' or symbol_lower == 'btcd':
             if 'btc.d' in crypto_data:
-                data = crypto_data['btc.d']
-                dominance = data.get('usd', 0)
-                change_24h = data.get('usd_24h_change', 0)
-                
-                # Определяем эмодзи для изменения
-                if change_24h > 0:
-                    change_emoji = "📈"
-                    change_color = "+"
-                elif change_24h < 0:
-                    change_emoji = "📉"
-                    change_color = ""
-                else:
-                    change_emoji = "➡️"
-                    change_color = ""
-                
-                result += f"**BTC.D** 👑 {change_emoji}\n"
-                result += f"📊 Доминация: **{dominance:.2f}%**\n"
-                if change_24h != 0:
-                    result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+                result += f"**BTC.D** 👑\n"
                 result += f"💡 Bitcoin доминация на рынке\n"
                 result += f"📈 [TradingView]({get_tradingview_link('btc.d')})\n\n"
                 continue
         
-        # Специальная обработка для NASDAQ
+        # Специальная обработка для NASDAQ (только ссылка)
         if symbol_lower == 'nasdaq':
             if 'nasdaq' in crypto_data:
-                data = crypto_data['nasdaq']
-                price = data.get('usd', 0)
-                change_24h = data.get('usd_24h_change', 0)
-                
-                # Определяем эмодзи для изменения цены
-                if change_24h > 0:
-                    change_emoji = "📈"
-                    change_color = "+"
-                elif change_24h < 0:
-                    change_emoji = "📉"
-                    change_color = ""
-                else:
-                    change_emoji = "➡️"
-                    change_color = ""
-                
-                result += f"**NASDAQ** 📊 {change_emoji}\n"
-                result += f"💰 Индекс: **{price:,.2f}**\n"
-                result += f"📊 24ч: **{change_color}{change_24h:.2f}%**\n"
+                result += f"**NASDAQ** 📊\n"
                 result += f"🏛️ Фондовый рынок США\n"
                 result += f"📈 [TradingView]({get_tradingview_link('nasdaq')})\n\n"
                 continue
         
-        # Обычные криптовалюты
-        coin_id = CRYPTO_SYMBOLS.get(symbol_lower, symbol_lower)
-        
-        # Ищем данные по разным ключам
-        data_key = None
-        if coin_id in crypto_data:
-            data_key = coin_id
-        else:
-            # Ищем по всем ключам в crypto_data
-            for key in crypto_data.keys():
-                if key != 'btc.d' and key != 'nasdaq':
-                    if crypto_data[key].get('original_symbol', '').lower() == symbol_lower:
-                        data_key = key
-                        break
-        
-        if data_key:
-            data = crypto_data[data_key]
+        # Обычные криптовалюты - теперь ищем по symbol_lower ключу
+        if symbol_lower in crypto_data:
+            data = crypto_data[symbol_lower]
             price = data.get('usd', 0)
             change_24h = data.get('usd_24h_change', 0)
             market_cap = data.get('usd_market_cap', 0)
@@ -803,9 +1016,15 @@ def format_crypto_data(crypto_data, requested_symbols):
             
             # Форматирование цены
             if symbol_lower in ['btc', 'eth']:
-                price_str = f"${price:,.2f}" if price >= 1 else f"${price:.6f}"
+                if price >= 1:
+                    price_str = f"${price:,.2f}"
+                else:
+                    price_str = f"${price:.6f}"
             else:
-                price_str = f"${price:,.4f}" if price >= 1 else f"${price:.8f}"
+                if price >= 1:
+                    price_str = f"${price:,.4f}"
+                else:
+                    price_str = f"${price:.8f}"
             
             # Форматирование рыночной капитализации
             if market_cap >= 1_000_000_000:
@@ -823,6 +1042,10 @@ def format_crypto_data(crypto_data, requested_symbols):
             if market_cap > 0:
                 result += f"🏦 Кап: **{market_cap_str}**\n"
             result += f"📈 [TradingView]({get_tradingview_link(symbol)})\n\n"
+        else:
+            # Если данные не найдены
+            result += f"**{symbol.upper()}** ❌\n"
+            result += f"💰 Данные недоступны\n\n"
     
     return result.strip() if result else "❌ Данные недоступны"
 
@@ -843,7 +1066,7 @@ async def crypto_command(ctx, *symbols):
                 
                 formatted_data = format_crypto_data(crypto_data, default_symbols)
                 embed.description = formatted_data
-                embed.set_footer(text="Данные предоставлены CoinGecko • Обновляется в реальном времени")
+                embed.set_footer(text="Данные предоставлены CoinPaprika • Обновляется в реальном времени")
                 
                 await ctx.reply(embed=embed)
             else:
@@ -860,7 +1083,7 @@ async def crypto_command(ctx, *symbols):
                 
                 formatted_data = format_crypto_data(crypto_data, symbols)
                 embed.description = formatted_data
-                embed.set_footer(text="Данные предоставлены CoinGecko • Обновляется в реальном времени")
+                embed.set_footer(text="Данные предоставлены CoinPaprika • Обновляется в реальном времени")
                 
                 await ctx.reply(embed=embed)
             else:
@@ -1019,6 +1242,101 @@ async def help_command(ctx):
     embed.set_footer(text="Бот создан для общения на русском языке")
     await ctx.reply(embed=embed)
 
+@bot.command(name='тест')
+@commands.has_permissions(administrator=True)
+async def test_apis(ctx):
+    """Тестировать API для отладки"""
+    await ctx.reply("🔍 Тестирую API...")
+    
+    # Подробный тест BTC Dominance
+    try:
+        # Тест CoinPaprika
+        async with aiohttp.ClientSession() as session:
+            url = "https://api.coinpaprika.com/v1/global"
+            async with session.get(url, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    cp_dominance = data.get('bitcoin_dominance_percentage', 0)
+                    await ctx.send(f"📊 CoinPaprika BTC.D: {cp_dominance:.2f}%")
+                else:
+                    await ctx.send(f"❌ CoinPaprika Global: HTTP {response.status}")
+        
+        # Тест CoinGecko
+        async with aiohttp.ClientSession() as session:
+            url = "https://api.coingecko.com/api/v3/global"
+            async with session.get(url, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    cg_dominance = data.get('data', {}).get('market_cap_percentage', {}).get('btc', 0)
+                    await ctx.send(f"📊 CoinGecko BTC.D: {cg_dominance:.2f}%")
+                else:
+                    await ctx.send(f"❌ CoinGecko Global: HTTP {response.status}")
+        
+        # Итоговый тест функции
+        btc_dom = await get_btc_dominance()
+        if btc_dom:
+            await ctx.send(f"✅ Итоговый BTC.D: {btc_dom['usd']:.2f}%")
+        else:
+            await ctx.send("❌ BTC.D API не работает")
+    except Exception as e:
+        await ctx.send(f"❌ BTC.D ошибка: {e}")
+    
+    # Тест NASDAQ
+    try:
+        nasdaq = await get_nasdaq_data()
+        if nasdaq:
+            await ctx.send(f"✅ NASDAQ API работает: {nasdaq['usd']:,.2f}")
+        else:
+            await ctx.send("❌ NASDAQ API не работает")
+    except Exception as e:
+        await ctx.send(f"❌ NASDAQ ошибка: {e}")
+    
+    # Тест CoinPaprika
+    try:
+        btc_data = await fetch_coinpaprika_data('btc')
+        if btc_data:
+            await ctx.send(f"✅ CoinPaprika API работает: BTC ${btc_data['usd']:,.2f}")
+        else:
+            await ctx.send("❌ CoinPaprika API не работает")
+    except Exception as e:
+        await ctx.send(f"❌ CoinPaprika ошибка: {e}")
+
+@bot.command(name='обновить')
+@commands.has_permissions(administrator=True)
+async def refresh_cache(ctx):
+    """Очистить кэш и получить свежие данные"""
+    global crypto_cache
+    old_size = len(crypto_cache)
+    crypto_cache.clear()
+    await ctx.reply(f"🔄 Кэш очищен! Удалено {old_size} записей. Следующий запрос получит свежие данные.")
+
+@bot.command(name='кэш')
+@commands.has_permissions(administrator=True)
+async def cache_info(ctx):
+    """Показать информацию о кэше"""
+    if not crypto_cache:
+        await ctx.reply("📊 Кэш пуст")
+        return
+    
+    now = time.time()
+    cache_info = []
+    
+    for key, (data, timestamp) in crypto_cache.items():
+        age = int(now - timestamp)
+        if isinstance(data, dict) and 'usd' in data:
+            value = f"${data['usd']:,.2f}" if data['usd'] >= 1 else f"${data['usd']:.6f}"
+            cache_info.append(f"• {key}: {value} ({age}с назад)")
+        else:
+            cache_info.append(f"• {key}: {age}с назад")
+    
+    embed = discord.Embed(
+        title="📊 Статистика кэша",
+        description="\n".join(cache_info[:15]),  # Показываем первые 15
+        color=0x00ff00
+    )
+    embed.set_footer(text=f"Всего записей: {len(crypto_cache)}")
+    await ctx.reply(embed=embed)
+
 if __name__ == "__main__":
     # Запуск бота
     token = os.getenv('DISCORD_TOKEN')
@@ -1029,3 +1347,264 @@ if __name__ == "__main__":
             bot.run(token)
         except Exception as e:
             print(f"Ошибка запуска бота: {e}")
+import random
+
+@bot.command(name='poll', aliases=['рандом'])
+async def poll_command(ctx, max_number: int = None):
+    """Выбрать случайное число от 1 до указанного"""
+    if max_number is None:
+        await ctx.reply("❌ Укажите максимальное число! Пример: `!poll 100` или `!рандом 50`")
+        return
+    
+    if max_number < 1:
+        await ctx.reply("❌ Число должно быть больше 0!")
+        return
+    
+    if max_number > 1000000:
+        await ctx.reply("❌ Число слишком большое! Максимум: 1,000,000")
+        return
+    
+    try:
+        # Генерируем случайное число от 1 до max_number
+        random_number = random.randint(1, max_number)
+        
+        # Создаем красивый embed
+        embed = discord.Embed(
+            title="🎲 Случайное число",
+            color=0x00ff00
+        )
+        
+        embed.add_field(
+            name="Диапазон",
+            value=f"1 - {max_number:,}",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="Результат",
+            value=f"**{random_number:,}**",
+            inline=True
+        )
+        
+        embed.set_footer(text=f"Запросил: {ctx.author.display_name}")
+        
+        await ctx.reply(embed=embed)
+        
+    except Exception as e:
+        await ctx.reply("❌ Произошла ошибка при генерации числа.")
+        print(f"Ошибка в команде poll: {e}")
+# Музыкальный функционал
+# Хранилище для голосовых подключений
+voice_clients = {}
+
+# Настройки для yt-dlp
+ytdl_format_options = {
+    'format': 'bestaudio/best',
+    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
+    'restrictfilenames': True,
+    'noplaylist': True,
+    'nocheckcertificate': True,
+    'ignoreerrors': False,
+    'logtostderr': False,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'auto',
+    'source_address': '0.0.0.0'
+}
+
+ffmpeg_options = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    'options': '-vn'
+}
+
+ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
+
+class YTDLSource(discord.PCMVolumeTransformer):
+    def __init__(self, source, *, data, volume=0.5):
+        super().__init__(source, volume)
+        self.data = data
+        self.title = data.get('title')
+        self.url = data.get('url')
+
+    @classmethod
+    async def from_url(cls, url, *, loop=None, stream=False):
+        loop = loop or asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+        
+        if 'entries' in data:
+            # Берем первый результат из плейлиста
+            data = data['entries'][0]
+        
+        filename = data['url'] if stream else ytdl.prepare_filename(data)
+        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+
+@bot.command(name='join', aliases=['подключиться'])
+async def join_voice(ctx):
+    """Подключиться к голосовому каналу"""
+    if ctx.author.voice is None:
+        await ctx.reply("❌ Вы не находитесь в голосовом канале!")
+        return
+    
+    voice_channel = ctx.author.voice.channel
+    
+    if ctx.voice_client is None:
+        voice_client = await voice_channel.connect()
+        voice_clients[ctx.guild.id] = voice_client
+        await ctx.reply(f"✅ Подключился к каналу **{voice_channel.name}**")
+    else:
+        await ctx.voice_client.move_to(voice_channel)
+        await ctx.reply(f"✅ Переместился в канал **{voice_channel.name}**")
+
+@bot.command(name='leave', aliases=['отключиться'])
+async def leave_voice(ctx):
+    """Отключиться от голосового канала"""
+    if ctx.voice_client is None:
+        await ctx.reply("❌ Я не подключен к голосовому каналу!")
+        return
+    
+    await ctx.voice_client.disconnect()
+    if ctx.guild.id in voice_clients:
+        del voice_clients[ctx.guild.id]
+    await ctx.reply("✅ Отключился от голосового канала")
+
+@bot.command(name='play', aliases=['играть'])
+async def play_music(ctx, *, query):
+    """Воспроизвести музыку по ссылке или названию"""
+    # Проверяем, подключен ли бот к голосовому каналу
+    if ctx.voice_client is None:
+        if ctx.author.voice is None:
+            await ctx.reply("❌ Вы не находитесь в голосовом канале! Подключитесь к каналу и попробуйте снова.")
+            return
+        
+        voice_channel = ctx.author.voice.channel
+        voice_client = await voice_channel.connect()
+        voice_clients[ctx.guild.id] = voice_client
+        await ctx.send(f"✅ Подключился к каналу **{voice_channel.name}**")
+    
+    # Останавливаем текущее воспроизведение если есть
+    if ctx.voice_client.is_playing():
+        ctx.voice_client.stop()
+    
+    try:
+        await ctx.send(f"🔍 Ищу: **{query}**...")
+        
+        # Получаем аудио источник
+        player = await YTDLSource.from_url(query, loop=bot.loop, stream=True)
+        
+        # Воспроизводим
+        ctx.voice_client.play(player, after=lambda e: print(f'Ошибка воспроизведения: {e}') if e else None)
+        
+        embed = discord.Embed(
+            title="🎵 Сейчас играет",
+            description=f"**{player.title}**",
+            color=0x00ff00
+        )
+        embed.set_footer(text=f"Запросил: {ctx.author.display_name}")
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.reply(f"❌ Ошибка при воспроизведении: {str(e)}")
+        print(f"Ошибка воспроизведения: {e}")
+
+@bot.command(name='radio', aliases=['радио'])
+async def play_radio(ctx):
+    """Включить радио Bluford"""
+    # Проверяем, подключен ли бот к голосовому каналу
+    if ctx.voice_client is None:
+        if ctx.author.voice is None:
+            await ctx.reply("❌ Вы не находитесь в голосовом канале! Подключитесь к каналу и попробуйте снова.")
+            return
+        
+        voice_channel = ctx.author.voice.channel
+        voice_client = await voice_channel.connect()
+        voice_clients[ctx.guild.id] = voice_client
+        await ctx.send(f"✅ Подключился к каналу **{voice_channel.name}**")
+    
+    # Останавливаем текущее воспроизведение если есть
+    if ctx.voice_client.is_playing():
+        ctx.voice_client.stop()
+    
+    try:
+        radio_url = "http://bluford.torontocast.com:8085/stream/"
+        
+        await ctx.send("📻 Подключаюсь к радио Bluford...")
+        
+        # Создаем аудио источник для радио
+        source = discord.FFmpegPCMAudio(radio_url, **ffmpeg_options)
+        
+        # Воспроизводим радио
+        ctx.voice_client.play(source, after=lambda e: print(f'Ошибка радио: {e}') if e else None)
+        
+        embed = discord.Embed(
+            title="📻 Радио включено",
+            description="**Bluford Radio**\nПрямой эфир",
+            color=0xff6b6b
+        )
+        embed.add_field(name="Ссылка", value="http://bluford.torontocast.com:8085/stream/", inline=False)
+        embed.set_footer(text=f"Запросил: {ctx.author.display_name}")
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.reply(f"❌ Ошибка при подключении к радио: {str(e)}")
+        print(f"Ошибка радио: {e}")
+
+@bot.command(name='stop', aliases=['стоп'])
+async def stop_music(ctx):
+    """Остановить воспроизведение"""
+    if ctx.voice_client is None:
+        await ctx.reply("❌ Я не подключен к голосовому каналу!")
+        return
+    
+    if ctx.voice_client.is_playing():
+        ctx.voice_client.stop()
+        await ctx.reply("⏹️ Воспроизведение остановлено")
+    else:
+        await ctx.reply("❌ Ничего не воспроизводится")
+
+@bot.command(name='pause', aliases=['пауза'])
+async def pause_music(ctx):
+    """Поставить на паузу"""
+    if ctx.voice_client is None:
+        await ctx.reply("❌ Я не подключен к голосовому каналу!")
+        return
+    
+    if ctx.voice_client.is_playing():
+        ctx.voice_client.pause()
+        await ctx.reply("⏸️ Воспроизведение приостановлено")
+    else:
+        await ctx.reply("❌ Ничего не воспроизводится")
+
+@bot.command(name='resume', aliases=['продолжить'])
+async def resume_music(ctx):
+    """Продолжить воспроизведение"""
+    if ctx.voice_client is None:
+        await ctx.reply("❌ Я не подключен к голосовому каналу!")
+        return
+    
+    if ctx.voice_client.is_paused():
+        ctx.voice_client.resume()
+        await ctx.reply("▶️ Воспроизведение продолжено")
+    else:
+        await ctx.reply("❌ Воспроизведение не приостановлено")
+
+@bot.command(name='volume', aliases=['громкость'])
+async def change_volume(ctx, volume: int = None):
+    """Изменить громкость (0-100)"""
+    if ctx.voice_client is None:
+        await ctx.reply("❌ Я не подключен к голосовому каналу!")
+        return
+    
+    if volume is None:
+        current_volume = int(ctx.voice_client.source.volume * 100) if hasattr(ctx.voice_client.source, 'volume') else 50
+        await ctx.reply(f"🔊 Текущая громкость: **{current_volume}%**")
+        return
+    
+    if volume < 0 or volume > 100:
+        await ctx.reply("❌ Громкость должна быть от 0 до 100!")
+        return
+    
+    if hasattr(ctx.voice_client.source, 'volume'):
+        ctx.voice_client.source.volume = volume / 100
+        await ctx.reply(f"🔊 Громкость установлена на **{volume}%**")
+    else:
+        await ctx.reply("❌ Невозможно изменить громкость для этого источника")
