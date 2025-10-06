@@ -271,49 +271,160 @@ async def play_radio(ctx):
     
     voice_client = voice_clients[ctx.guild.id]
     
-    # Останавливаем текущее воспроизведение
-    if voice_client.is_playing():
+    # Правильно останавливаем текущее воспроизведение
+    if voice_client.is_playing() or voice_client.is_paused():
         voice_client.stop()
+        # Ждем завершения FFmpeg процесса
+        await asyncio.sleep(3)
+    
+    try:
+        # Список рабочих радиостанций
+        radio_stations = [
+            {
+                'name': 'DFM',
+                'url': 'http://dfm.hostingradio.ru/dfm96.aacp',
+                'description': 'Танцевальная музыка'
+            },
+            {
+                'name': 'Europa Plus',
+                'url': 'http://ep256.hostingradio.ru:8052/europaplus256.mp3',
+                'description': 'Популярная музыка'
+            },
+            {
+                'name': 'Radio Record',
+                'url': 'http://air.radiorecord.ru:8102/rr_320',
+                'description': 'Электронная музыка'
+            }
+        ]
+        
+        status_msg = await ctx.send("🔄 Ищу рабочую радиостанцию...")
+        
+        for station in radio_stations:
+            try:
+                await status_msg.edit(content=f"🔄 Пробую **{station['name']}**...")
+                
+                # Оптимизированные настройки FFmpeg для стабильности
+                ffmpeg_options = {
+                    'before_options': (
+                        '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 '
+                        '-nostdin -hide_banner -loglevel error'
+                    ),
+                    'options': '-vn -acodec pcm_s16le -ar 48000 -ac 2 -bufsize 64k'
+                }
+                
+                # Создаем источник с обработчиком ошибок
+                def after_playing(error):
+                    if error:
+                        print(f'FFmpeg error for {station["name"]}: {error}')
+                    else:
+                        print(f'{station["name"]} stopped cleanly')
+                
+                source = FFmpegPCMAudio(station['url'], **ffmpeg_options)
+                voice_client.play(source, after=after_playing)
+                
+                # Ждем стабилизации
+                await asyncio.sleep(4)
+                
+                if voice_client.is_playing():
+                    embed = discord.Embed(
+                        title="📻 Радио включено!",
+                        description=f"**{station['name']}**\n{station['description']}",
+                        color=0x00ff00
+                    )
+                    embed.add_field(name="Статус", value="🔴 В эфире", inline=True)
+                    embed.add_field(name="Качество", value="Высокое", inline=True)
+                    embed.add_field(name="Команды", value="`!stop` - остановить", inline=True)
+                    
+                    await status_msg.edit(content="", embed=embed)
+                    return
+                else:
+                    # Если не играет, останавливаем и пробуем следующую
+                    voice_client.stop()
+                    await asyncio.sleep(2)
+                    
+            except Exception as e:
+                print(f"Error with {station['name']}: {e}")
+                # Принудительно останавливаем при ошибке
+                if voice_client.is_playing():
+                    voice_client.stop()
+                    await asyncio.sleep(2)
+                continue
+        
+        # Если ни одна станция не заработала
+        await status_msg.edit(content="❌ Не удалось подключиться к радиостанциям. Попробуйте `!radio_simple` для упрощенной версии.")
+            
+    except Exception as e:
+        await ctx.reply(f"❌ Критическая ошибка: {str(e)}")
+        print(f"Critical radio error: {e}")
+        # Принудительная очистка при критической ошибке
+        if voice_client.is_playing():
+            voice_client.stop()
+
+@bot.command(name='radio_simple', aliases=['радио_простое'])
+async def radio_simple(ctx):
+    """Упрощенная команда радио без сложных настроек FFmpeg"""
+    if not ctx.author.voice:
+        await ctx.reply("❌ Вы не подключены к голосовому каналу!")
+        return
+    
+    # Подключаемся к каналу если не подключены
+    if ctx.guild.id not in voice_clients:
+        try:
+            voice_client = await ctx.author.voice.channel.connect()
+            voice_clients[ctx.guild.id] = voice_client
+        except Exception as e:
+            await ctx.reply(f"❌ Ошибка подключения: {str(e)}")
+            return
+    
+    voice_client = voice_clients[ctx.guild.id]
+    
+    # Корректно останавливаем текущее воспроизведение
+    if voice_client.is_playing() or voice_client.is_paused():
+        voice_client.stop()
+        # Ждем завершения процесса
         await asyncio.sleep(2)
     
     try:
-        # Используем простую и надежную радиостанцию
-        radio_url = "http://stream.radiorecord.ru:8102/rr_320"
+        # Простая рабочая радиостанция
+        radio_url = "http://air.radiorecord.ru:8102/rr_320"
         
-        # ПРАВИЛЬНЫЕ настройки для Discord - это критично!
+        await ctx.send("🔄 Подключаюсь к Radio Record (упрощенный режим)...")
+        
+        # Минимальные настройки FFmpeg
         ffmpeg_options = {
-            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin',
-            'options': '-vn -f s16le -ar 48000 -ac 2 -loglevel panic'
+            'before_options': '-nostdin -loglevel quiet',
+            'options': '-vn'
         }
         
-        await ctx.send("🔄 Подключаюсь к Radio Record...")
+        # Создаем источник с простым обработчиком
+        def after_simple(error):
+            if error:
+                print(f'Simple radio error: {error}')
+            else:
+                print('Simple radio stopped')
         
-        # Создаем источник аудио с правильными настройками
         source = FFmpegPCMAudio(radio_url, **ffmpeg_options)
+        voice_client.play(source, after=after_simple)
         
-        # Запускаем воспроизведение
-        voice_client.play(source, after=lambda e: print(f'Player error: {e}') if e else None)
-        
-        # Ждем стабилизации потока
-        await asyncio.sleep(3)
+        # Короткая проверка
+        await asyncio.sleep(2)
         
         if voice_client.is_playing():
             embed = discord.Embed(
-                title="📻 Радио включено!",
-                description="Воспроизводится: **Radio Record**",
+                title="📻 Простое радио включено!",
+                description="**Radio Record** (упрощенный режим)",
                 color=0x00ff00
             )
-            embed.add_field(name="Статус", value="🔴 В эфире", inline=True)
-            embed.add_field(name="Качество", value="320 kbps", inline=True)
-            embed.add_field(name="Формат", value="PCM 48kHz", inline=True)
+            embed.add_field(name="Режим", value="Упрощенный", inline=True)
+            embed.add_field(name="Статус", value="🔴 Играет", inline=True)
             
             await ctx.reply(embed=embed)
         else:
-            await ctx.reply("❌ Не удалось запустить воспроизведение. Попробуйте `!radio_fix`")
+            await ctx.reply("❌ Не удалось запустить упрощенное радио. Проверьте подключение к интернету.")
             
     except Exception as e:
-        await ctx.reply(f"❌ Ошибка воспроизведения: {str(e)}")
-        print(f"Radio error: {e}")
+        await ctx.reply(f"❌ Ошибка упрощенного радио: {str(e)}")
+        print(f"Simple radio error: {e}")
 
 @bot.command(name='radio_fix', aliases=['радио_фикс'])
 async def radio_fix(ctx):
